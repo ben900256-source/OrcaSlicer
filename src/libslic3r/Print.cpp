@@ -2145,6 +2145,7 @@ void  PrintObject::clear_shared_object()
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": this=%1%, clear previous shared object data %2%")%this %m_shared_object;
         m_layers.clear();
         m_support_layers.clear();
+        m_support_contacts.clear();
 
         m_shared_object = nullptr;
 
@@ -2164,6 +2165,7 @@ void  PrintObject::copy_layers_from_shared_object()
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": this=%1%, copied layers from object %2%")%this%m_shared_object;
         m_layers = m_shared_object->layers();
         m_support_layers = m_shared_object->support_layers();
+        m_support_contacts = m_shared_object->support_contacts();
 
         firstLayerObjSliceByVolume = m_shared_object->firstLayerObjSlice();
         firstLayerObjSliceByGroups = m_shared_object->firstLayerObjGroups();
@@ -4608,6 +4610,7 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 
 #define JSON_LAYERS                  "layers"
 #define JSON_SUPPORT_LAYERS                  "support_layers"
+#define JSON_SUPPORT_CONTACTS                "support_contacts"
 #define JSON_TREE_SUPPORT_LAYERS                  "tree_support_layers"
 #define JSON_LAYER_REGIONS                  "layer_regions"
 #define JSON_FIRSTLAYER_GROUPS                  "first_layer_groups"
@@ -4768,7 +4771,9 @@ static void to_json(json& j, const Polyline& poly_line) {
 }
 
 static void to_json(json& j, const ExtrusionPath& extrusion_path) {
-    j[JSON_EXTRUSION_POLYLINE] = extrusion_path.polyline;
+    // The slicedata reader expects the structured 2D Polyline representation.
+    // Extrusion paths are planar here, so dropping the zero Z coordinate is lossless.
+    j[JSON_EXTRUSION_POLYLINE] = extrusion_path.polyline.to_polyline();
     j[JSON_EXTRUSION_MM3_PER_MM] = extrusion_path.mm3_per_mm;
     j[JSON_EXTRUSION_WIDTH] = extrusion_path.width;
     j[JSON_EXTRUSION_HEIGHT] = extrusion_path.height;
@@ -5044,8 +5049,19 @@ static void from_json(const json& j, Polyline& poly_line) {
 }
 
 static void from_json(const json& j, ExtrusionPath& extrusion_path) {
-    Polyline temp_polyline = j[JSON_EXTRUSION_POLYLINE];
-    extrusion_path.polyline = Polyline3(temp_polyline);
+    const json &polyline_json = j[JSON_EXTRUSION_POLYLINE];
+    if (polyline_json.is_array()) {
+        // Compatibility with slicedata written as a bare Polyline3 point array.
+        Points3 points;
+        points.reserve(polyline_json.size());
+        for (const json &point_json : polyline_json)
+            points.emplace_back(point_json.at(0).get<coord_t>(), point_json.at(1).get<coord_t>(),
+                                point_json.at(2).get<coord_t>());
+        extrusion_path.polyline = Polyline3(points);
+    } else {
+        Polyline temp_polyline = polyline_json;
+        extrusion_path.polyline = Polyline3(temp_polyline);
+    }
     extrusion_path.mm3_per_mm             =    j[JSON_EXTRUSION_MM3_PER_MM];
     extrusion_path.width                  =    j[JSON_EXTRUSION_WIDTH];
     extrusion_path.height                 =    j[JSON_EXTRUSION_HEIGHT];
@@ -5337,6 +5353,100 @@ static void from_json(const json& j, groupedVolumeSlices& firstlayer_group)
     }
 }
 
+std::string Print::validate_support_contact_export() const
+{
+    for (const PrintObject *object : m_objects) {
+        // A support-disabled object contributes a valid empty contact list. A
+        // raft alone is not a set of discrete model contacts either.
+        if (!object->has_support())
+            continue;
+
+        const PrintObjectConfig &config = object->config();
+        if (!is_tree(config.support_type.value) ||
+            (config.support_style.value != smsDefault && config.support_style.value != smsTreeOrganic))
+            return "Support contacts are available only for Organic tree supports; object '" +
+                   object->model_object()->name + "' uses another support style.";
+        if (config.support_interface_top_layers.value != 0)
+            return "Support contacts require top interface layers to be 0; object '" +
+                   object->model_object()->name + "' has a top interface enabled.";
+    }
+    return {};
+}
+
+void Print::export_support_contacts(const std::string &path, size_t plate_number) const
+{
+    if (std::string error = this->validate_support_contact_export(); !error.empty())
+        throw Slic3r::InvalidArgument(error);
+
+    json instances_json = json::array();
+    size_t contact_count = 0;
+    double total_nominal_area = 0.;
+
+    for (const PrintObject *object : m_objects) {
+        const auto &contacts = object->support_contacts();
+        for (const PrintInstance &instance : object->instances()) {
+            json contacts_json = json::array();
+            const Point shift = instance.shift_without_plate_offset();
+            double instance_nominal_area = 0.;
+
+            for (const SupportContact &contact : contacts) {
+                const Point plate_position = contact.position + shift;
+                const double radius = unscale<double>(contact.nominal_radius);
+                contacts_json.push_back({
+                    { "x", unscale<double>(plate_position.x()) },
+                    { "y", unscale<double>(plate_position.y()) },
+                    { "support_tip_z", contact.support_tip_z },
+                    { "model_contact_z", contact.model_contact_z },
+                    { "nominal_radius", radius },
+                    { "object_layer_id", contact.object_layer_id }
+                });
+                instance_nominal_area += PI * radius * radius;
+            }
+
+            instances_json.push_back({
+                { "object_id", object->model_object()->id().id },
+                { "object_name", object->model_object()->name },
+                { "instance_id", instance.model_instance->id().id },
+                { "contact_count", contacts.size() },
+                { "total_nominal_circular_area", instance_nominal_area },
+                { "contacts", std::move(contacts_json) }
+            });
+            contact_count += contacts.size();
+            total_nominal_area += instance_nominal_area;
+        }
+    }
+
+    json root_json = {
+        { "schema_version", 1 },
+        { "plate", plate_number },
+        { "coordinate_space", "plate-local" },
+        { "units", {
+            { "position", "mm" },
+            { "z", "mm" },
+            { "radius", "mm" },
+            { "area", "mm^2" }
+        } },
+        { "contact_count", contact_count },
+        { "total_nominal_circular_area", total_nominal_area },
+        { "instances", std::move(instances_json) }
+    };
+
+    const boost::filesystem::path output_path(path);
+    try {
+        const boost::filesystem::path parent = output_path.parent_path();
+        if (!parent.empty())
+            fs::create_directories(parent);
+        boost::nowide::ofstream output(path, std::ios::out | std::ios::trunc);
+        if (!output)
+            throw Slic3r::FileIOError("Failed opening support contact report for writing: " + path);
+        output << root_json.dump(2) << '\n';
+        if (!output)
+            throw Slic3r::FileIOError("Failed writing support contact report: " + path);
+    } catch (const boost::filesystem::filesystem_error &error) {
+        throw Slic3r::FileIOError("Failed creating support contact report '" + path + "': " + error.what());
+    }
+}
+
 int Print::export_cached_data(const std::string& directory, bool with_space)
 {
     int ret = 0;
@@ -5529,6 +5639,19 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
             } // for each layer*/
             root_json[JSON_SUPPORT_LAYERS] = std::move(support_layers_json);
 
+            json support_contacts_json = json::array();
+            for (const SupportContact &contact : obj->support_contacts()) {
+                support_contacts_json.push_back({
+                    { "x_scaled", contact.position.x() },
+                    { "y_scaled", contact.position.y() },
+                    { "support_tip_z", contact.support_tip_z },
+                    { "model_contact_z", contact.model_contact_z },
+                    { "nominal_radius_scaled", contact.nominal_radius },
+                    { "object_layer_id", contact.object_layer_id }
+                });
+            }
+            root_json[JSON_SUPPORT_CONTACTS] = std::move(support_contacts_json);
+
             const std::vector<groupedVolumeSlices> &first_layer_obj_groups =  obj->firstLayerObjGroups();
             for (size_t s_group_index = 0; s_group_index < first_layer_obj_groups.size(); ++ s_group_index) {
                 groupedVolumeSlices group = first_layer_obj_groups[s_group_index];
@@ -5682,6 +5805,7 @@ int Print::load_cached_data(const std::string& directory)
     for (int obj_index = 0; obj_index < object_jsons.size(); obj_index++) {
         json& root_json = object_jsons[obj_index];
         PrintObject *obj = object_filenames[obj_index].second;
+        const char *load_stage = "object metadata";
 
         try {
             //boost::nowide::ifstream ifs(file_name);
@@ -5698,6 +5822,7 @@ int Print::load_cached_data(const std::string& directory)
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(":will load %1%, identify_id %2%, layer_count %3%, support_layer_count %4%, firstlayer_group_count %5%")
                 %name %identify_id %layer_count %support_layer_count %firstlayer_group_count;
 
+            load_stage = "object layers";
             Layer* previous_layer = NULL;
             //create layer and layer regions
             for (int index = 0; index < layer_count; index++)
@@ -5747,6 +5872,7 @@ int Print::load_cached_data(const std::string& directory)
                 }
             );
 
+            load_stage = "support layers";
             //support layers
             Layer* previous_support_layer = NULL;
             //create support_layers
@@ -5777,6 +5903,23 @@ int Print::load_cached_data(const std::string& directory)
                 }
             );
 
+            load_stage = "support contacts";
+            // This field is optional so slicedata produced by older versions
+            // remains loadable. New caches retain exact scaled XY/radius data.
+            obj->m_support_contacts.clear();
+            if (root_json.contains(JSON_SUPPORT_CONTACTS)) {
+                for (const json &contact_json : root_json[JSON_SUPPORT_CONTACTS]) {
+                    obj->m_support_contacts.push_back({
+                        Point(contact_json.at("x_scaled").get<coord_t>(), contact_json.at("y_scaled").get<coord_t>()),
+                        contact_json.at("support_tip_z").get<coordf_t>(),
+                        contact_json.at("model_contact_z").get<coordf_t>(),
+                        contact_json.at("nominal_radius_scaled").get<coord_t>(),
+                        contact_json.at("object_layer_id").get<size_t>()
+                    });
+                }
+            }
+
+            load_stage = "first-layer groups";
             //load first group volumes
             std::vector<groupedVolumeSlices>& firstlayer_objgroups = obj->firstLayerObjGroupsMod();
             for (int index = 0; index < firstlayer_group_count; index++)
@@ -5806,11 +5949,13 @@ int Print::load_cached_data(const std::string& directory)
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": load object %1% from %2% successfully.")%count%object_filenames[obj_index].first;
         }
         catch(nlohmann::detail::parse_error &err) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": parse "<<object_filenames[obj_index].first<<" got a nlohmann::detail::parse_error, reason = " << err.what();
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": parse "<<object_filenames[obj_index].first<<" while loading " << load_stage
+                                     << " got a nlohmann::detail::parse_error, reason = " << err.what();
             return CLI_IMPORT_CACHE_LOAD_FAILED;
         }
         catch(std::exception &err) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": load from "<<object_filenames[obj_index].first<<" got a generic exception, reason = " << err.what();
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": load from "<<object_filenames[obj_index].first<<" while loading " << load_stage
+                                     << " got a generic exception, reason = " << err.what();
             ret = CLI_IMPORT_CACHE_LOAD_FAILED;
         }
     }

@@ -1118,6 +1118,7 @@ SupportLayer* PrintObject::get_support_layer_at_printz(coordf_t print_z, coordf_
 
 void PrintObject::clear_support_layers()
 {
+    m_support_contacts.clear();
     if (!m_shared_object) {
         for (SupportLayer* l : m_support_layers)
             delete l;

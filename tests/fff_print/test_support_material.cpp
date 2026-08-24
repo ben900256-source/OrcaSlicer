@@ -2,11 +2,81 @@
 
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/Support/TreeSupport.hpp"
+#include "libslic3r/Support/TreeSupportCommon.hpp"
+#include "nlohmann/json.hpp"
 
 #include "test_helpers.hpp" // get access to init_print, etc
+#include "test_utils.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <limits>
+#include <tuple>
+#include <vector>
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
+
+namespace {
+
+DynamicPrintConfig organic_contact_config(double spacing = 2., double density = 20.)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "enable_support",                        1 },
+        { "support_type",                         "tree(auto)" },
+        { "support_style",                        "organic" },
+        { "support_interface_top_layers",         0 },
+        { "support_remove_small_overhang",         0 },
+        { "bridge_no_support",                     0 },
+        { "support_line_width",                    0.4 },
+        { "tree_support_tip_diameter",             0.4 },
+        { "tree_support_branch_diameter_organic",  2.0 },
+        { "tree_support_branch_diameter_angle",    5.0 },
+        { "tree_support_branch_distance_organic",  spacing },
+        { "tree_support_top_rate",                 density },
+    });
+    return config;
+}
+
+using ContactSignature = std::tuple<coord_t, coord_t, coordf_t, coordf_t, coord_t, size_t>;
+
+std::vector<ContactSignature> contact_signatures(const PrintObject &object)
+{
+    std::vector<ContactSignature> out;
+    out.reserve(object.support_contacts().size());
+    for (const SupportContact &contact : object.support_contacts())
+        out.emplace_back(contact.position.x(), contact.position.y(), contact.support_tip_z,
+                         contact.model_contact_z, contact.nominal_radius, contact.object_layer_id);
+    return out;
+}
+
+double median_nearest_neighbour_distance(const std::vector<SupportContact> &contacts)
+{
+    std::vector<double> nearest;
+    nearest.reserve(contacts.size());
+    for (size_t i = 0; i < contacts.size(); ++i) {
+        double best = std::numeric_limits<double>::max();
+        for (size_t j = 0; j < contacts.size(); ++j) {
+            if (i == j || contacts[i].object_layer_id != contacts[j].object_layer_id)
+                continue;
+            const double dx = unscale<double>(contacts[i].position.x() - contacts[j].position.x());
+            const double dy = unscale<double>(contacts[i].position.y() - contacts[j].position.y());
+            best = std::min(best, std::hypot(dx, dy));
+        }
+        if (best < std::numeric_limits<double>::max())
+            nearest.push_back(best);
+    }
+    REQUIRE_FALSE(nearest.empty());
+    std::sort(nearest.begin(), nearest.end());
+    const size_t middle = nearest.size() / 2;
+    return nearest.size() % 2 == 0 ? 0.5 * (nearest[middle - 1] + nearest[middle]) : nearest[middle];
+}
+
+} // namespace
 
 TEST_CASE("Three raft layers are created", "[SupportMaterial]")
 {
@@ -103,4 +173,245 @@ TEST_CASE("Support G-code emission survives a second slice in the same process",
 
     const std::string second = slice({ TestMesh::overhang }, { { "enable_support", 1 } });
     REQUIRE(! layers_with_role(second, "support").empty());
+}
+
+TEST_CASE("Organic supports expose deterministic realized contacts", "[SupportMaterial][OrganicContacts]")
+{
+    const DynamicPrintConfig config = organic_contact_config();
+
+    Print first;
+    Model first_model;
+    init_print({ TestMesh::overhang }, first, first_model, config);
+    first.process();
+
+    const PrintObject &first_object = *first.objects().front();
+    const auto first_contacts = contact_signatures(first_object);
+    REQUIRE_FALSE(first_contacts.empty());
+    CHECK(std::is_sorted(first_contacts.begin(), first_contacts.end()));
+    for (const SupportContact &contact : first_object.support_contacts()) {
+        CHECK(contact.nominal_radius == scaled<coord_t>(0.2));
+        CHECK(contact.support_tip_z < contact.model_contact_z);
+        CHECK(contact.object_layer_id < first_object.layer_count());
+    }
+    const TreeSupport3D::TreeSupportMeshGroupSettings mesh_settings(first_object);
+    const TreeSupport3D::TreeSupportSettings tree_settings(mesh_settings, first_object.slicing_parameters());
+    coord_t                            previous_radius = 0;
+    TreeSupport3D::SupportElementState radius_state{};
+    for (size_t distance_to_top = 0; distance_to_top <= tree_settings.tip_layers; ++distance_to_top) {
+        radius_state.distance_to_top          = uint32_t(distance_to_top);
+        radius_state.effective_radius_height = uint32_t(distance_to_top);
+        const coord_t radius = TreeSupport3D::support_element_radius(tree_settings, radius_state);
+        CHECK(radius >= previous_radius);
+        previous_radius = radius;
+    }
+    CHECK(previous_radius == tree_settings.branch_radius);
+    CHECK(tree_settings.tip_layers * unscale<double>(tree_settings.layer_height) <= 1.5);
+    CHECK(first.validate_support_contact_export().empty());
+
+    const std::string support_gcode = gcode(first);
+    CHECK_FALSE(support_gcode.empty());
+    CHECK_FALSE(layers_with_role(support_gcode, "support").empty());
+
+    Print second;
+    Model second_model;
+    init_print({ TestMesh::overhang }, second, second_model, config);
+    second.process();
+    CHECK(contact_signatures(*second.objects().front()) == first_contacts);
+}
+
+TEST_CASE("Organic contact snapshots exclude unrealized branch endpoints", "[SupportMaterial][OrganicContacts]")
+{
+    Print print;
+    Model model;
+    init_print({ TestMesh::overhang }, print, model, organic_contact_config());
+    print.process();
+
+    PrintObject &object = *print.get_object(0);
+    const TreeSupport3D::TreeSupportMeshGroupSettings mesh_settings(object);
+    const TreeSupport3D::TreeSupportSettings tree_settings(mesh_settings, object.slicing_parameters());
+    const TreeSupport3D::LayerIndex target_height = 5;
+    REQUIRE(size_t(target_height) + tree_settings.z_distance_top_layers + 1 <
+            object.layer_count() + tree_settings.raft_layers.size());
+
+    TreeSupport3D::SupportElementState endpoint{};
+    endpoint.target_height           = target_height;
+    endpoint.target_position         = Point(scale_(10.), scale_(10.));
+    endpoint.next_position           = endpoint.target_position;
+    endpoint.layer_idx               = target_height;
+    endpoint.effective_radius_height = 0;
+    endpoint.distance_to_top         = 0;
+    endpoint.result_on_layer         = endpoint.target_position;
+    endpoint.increased_to_model_radius = 0;
+    endpoint.elephant_foot_increases  = 0.;
+    endpoint.dont_move_until          = 0;
+
+    TreeSupport3D::SupportElements elements;
+    elements.emplace_back(endpoint, Polygons{}); // realized and connected
+    elements.emplace_back(endpoint, Polygons{}); // disconnected
+    elements.emplace_back(endpoint, Polygons{}); // pruned
+    elements.back().state.deleted = true;
+    elements.emplace_back(endpoint, Polygons{}); // not a terminal node
+    elements.back().parents.push_back(0);
+
+    std::vector<std::pair<TreeSupport3D::SupportElement*, int>> endpoints = {
+        { &elements[0], 0 },
+        { &elements[1], -1 },
+        { &elements[2], 0 },
+        { &elements[3], 0 },
+    };
+    TreeSupport snapshotter(object, object.slicing_parameters());
+    snapshotter.store_organic_support_contacts(endpoints, tree_settings);
+
+    REQUIRE(object.support_contacts().size() == 1);
+    CHECK(object.support_contacts().front().position == endpoint.target_position);
+}
+
+TEST_CASE("Organic contacts survive invalidation and slicedata cache round trips", "[SupportMaterial][OrganicContacts]")
+{
+    DynamicPrintConfig config = organic_contact_config();
+    Print              print;
+    Model              model;
+    init_print({ TestMesh::overhang }, print, model, config);
+    print.process();
+
+    PrintObject &object = *print.get_object(0);
+    const auto expected = contact_signatures(object);
+    REQUIRE_FALSE(expected.empty());
+
+    config.set_deserialize_strict({ { "support_threshold_angle", 31 } });
+    print.apply(model, config);
+    CHECK_FALSE(object.is_step_done(posSupportMaterial));
+    CHECK(contact_signatures(object) == expected);
+
+    ScopedTemporaryDir temporary("support-contact-cache");
+    const boost::filesystem::path cache = temporary.path() / "slicedata";
+    REQUIRE(print.export_cached_data(cache.string(), false) == 0);
+
+    const ModelInstance *model_instance = object.instances().front().model_instance;
+    const size_t identify_id = model_instance->loaded_id > 0 ? model_instance->loaded_id : model_instance->id().id;
+    std::ifstream cache_stream((cache / ("obj_" + std::to_string(identify_id) + ".json")).string());
+    const nlohmann::json cached_object = nlohmann::json::parse(cache_stream);
+    REQUIRE(cached_object.is_object());
+    REQUIRE(cached_object.at("support_contacts").is_array());
+    for (const nlohmann::json &cached_contact : cached_object.at("support_contacts"))
+        REQUIRE(cached_contact.is_object());
+
+    REQUIRE(print.load_cached_data(cache.string()) == 0);
+    CHECK(contact_signatures(object) == expected);
+}
+
+TEST_CASE("Support contact reports apply instance transforms and summarize nominal area", "[SupportMaterial][OrganicContacts]")
+{
+    const DynamicPrintConfig config = organic_contact_config();
+    Print print;
+    Model model;
+    init_print({ TestMesh::overhang }, print, model, config);
+
+    ModelObject &model_object = *model.objects.front();
+    const Vec3d first_offset = model_object.instances.front()->get_offset();
+    model_object.add_instance()->set_offset(first_offset + Vec3d(40., 0., 0.));
+    print.apply(model, config);
+    print.process();
+
+    const size_t contacts_per_instance = print.objects().front()->support_contacts().size();
+    REQUIRE(contacts_per_instance > 0);
+
+    ScopedTemporaryFile report_file(".support-contacts.json");
+    print.export_support_contacts(report_file.string(), 3);
+    std::ifstream report_stream(report_file.string());
+    const nlohmann::json report = nlohmann::json::parse(report_stream);
+
+    CHECK(report.at("schema_version") == 1);
+    CHECK(report.at("plate") == 3);
+    CHECK(report.at("coordinate_space") == "plate-local");
+    CHECK(report.at("units").at("position") == "mm");
+    CHECK(report.at("units").at("area") == "mm^2");
+    CHECK(report.at("contact_count") == 2 * contacts_per_instance);
+    REQUIRE(report.at("instances").size() == 2);
+    CHECK(report.at("instances").at(0).at("contact_count") == contacts_per_instance);
+    CHECK(report.at("instances").at(1).at("contact_count") == contacts_per_instance);
+
+    const auto &first_contact  = report.at("instances").at(0).at("contacts").at(0);
+    const auto &second_contact = report.at("instances").at(1).at("contacts").at(0);
+    CHECK(first_contact.contains("support_tip_z"));
+    CHECK(first_contact.contains("model_contact_z"));
+    CHECK(first_contact.contains("nominal_radius"));
+    CHECK(first_contact.contains("object_layer_id"));
+    CHECK_THAT(second_contact.at("x").get<double>() - first_contact.at("x").get<double>(),
+               Catch::Matchers::WithinAbs(40., 1e-9));
+    CHECK_THAT(second_contact.at("y").get<double>(),
+               Catch::Matchers::WithinAbs(first_contact.at("y").get<double>(), 1e-9));
+
+    const double expected_area = 2. * contacts_per_instance * PI * 0.2 * 0.2;
+    CHECK_THAT(report.at("total_nominal_circular_area").get<double>(),
+               Catch::Matchers::WithinAbs(expected_area, 1e-9));
+}
+
+TEST_CASE("Support contact export rejects non-discrete support configurations", "[SupportMaterial][OrganicContacts]")
+{
+    SECTION("top interfaces") {
+        DynamicPrintConfig config = organic_contact_config();
+        config.set_deserialize_strict({ { "support_interface_top_layers", 1 } });
+        Print print;
+        Model model;
+        init_print({ TestMesh::overhang }, print, model, config);
+        print.process();
+        CHECK(print.validate_support_contact_export().find("top interface layers") != std::string::npos);
+        CHECK(print.objects().front()->support_contacts().empty());
+        CHECK_FALSE(layers_with_role(gcode(print), "support").empty());
+    }
+
+    SECTION("non-Organic tree style") {
+        DynamicPrintConfig config = organic_contact_config();
+        config.set_deserialize_strict({ { "support_style", "tree_slim" } });
+        Print print;
+        Model model;
+        init_print({ TestMesh::overhang }, print, model, config);
+        CHECK(print.validate_support_contact_export().find("only for Organic") != std::string::npos);
+    }
+
+    SECTION("support disabled") {
+        Print print;
+        Model model;
+        init_print({ cube(20) }, print, model);
+        print.process();
+        REQUIRE(print.validate_support_contact_export().empty());
+
+        ScopedTemporaryFile report_file(".support-contacts.json");
+        print.export_support_contacts(report_file.string(), 1);
+        std::ifstream report_stream(report_file.string());
+        const nlohmann::json report = nlohmann::json::parse(report_stream);
+        CHECK(report.at("contact_count") == 0);
+        CHECK(report.at("instances").at(0).at("contacts").empty());
+    }
+}
+
+TEST_CASE("Existing Organic controls realize sparse contact spacing", "[SupportMaterial][OrganicContacts]")
+{
+    struct Result {
+        size_t count;
+        double median_distance;
+    };
+    auto slice_coupon = [](double spacing, double density) {
+        Print print;
+        Model model;
+        init_print({ load_model("support_contact_coupon.obj") }, print, model, organic_contact_config(spacing, density));
+        print.process();
+        const std::vector<SupportContact> contacts = print.objects().front()->support_contacts();
+        REQUIRE(contacts.size() > 1);
+        return Result{ contacts.size(), median_nearest_neighbour_distance(contacts) };
+    };
+
+    const Result spacing_2 = slice_coupon(2., 20.);
+    const Result spacing_3 = slice_coupon(3., 13.33);
+    const Result spacing_4 = slice_coupon(4., 10.);
+    CAPTURE(spacing_2.count, spacing_2.median_distance,
+            spacing_3.count, spacing_3.median_distance,
+            spacing_4.count, spacing_4.median_distance);
+
+    CHECK(spacing_2.count > spacing_3.count);
+    CHECK(spacing_3.count > spacing_4.count);
+    CHECK_THAT(spacing_2.median_distance, Catch::Matchers::WithinAbs(2., 0.4));
+    CHECK_THAT(spacing_3.median_distance, Catch::Matchers::WithinAbs(3., 0.6));
+    CHECK_THAT(spacing_4.median_distance, Catch::Matchers::WithinAbs(4., 0.8));
 }

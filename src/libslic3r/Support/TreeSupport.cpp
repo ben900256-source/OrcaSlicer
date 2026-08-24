@@ -26,6 +26,7 @@
 
 #include <boost/log/trivial.hpp>
 #include <algorithm>
+#include <tuple>
 
 #ifndef M_PI
 #define M_PI 3.1415926535897932384626433832795
@@ -661,6 +662,52 @@ TreeSupport::TreeSupport(PrintObject& object, const SlicingParameters &slicing_p
     SVG svg(debug_out_path("machine_boarder.svg"), m_object->bounding_box());
     if (svg.is_opened()) svg.draw(m_machine_border, "yellow");
 #endif
+}
+
+void TreeSupport::store_organic_support_contacts(
+    const std::vector<std::pair<TreeSupport3D::SupportElement*, int>> &elements_with_link_down,
+    const TreeSupport3D::TreeSupportSettings                          &config)
+{
+    std::vector<SupportContact> contacts;
+
+    // With a top interface the terminal branches support that interface rather
+    // than contacting the model discretely.
+    if (m_object_config->support_interface_top_layers.value == 0) {
+        contacts.reserve(elements_with_link_down.size());
+        const size_t num_raft_layers  = config.raft_layers.size();
+        const size_t z_distance_delta = config.z_distance_top_layers + 1;
+
+        for (const auto &[element, link_down] : elements_with_link_down) {
+            const auto &state = element->state;
+            if (link_down < 0 || !element->parents.empty() || state.distance_to_top != 0 ||
+                !state.result_on_layer_is_set() || state.deleted || state.target_height < 0)
+                continue;
+
+            const size_t overhang_layer = size_t(state.target_height) + z_distance_delta;
+            if (overhang_layer < num_raft_layers)
+                continue;
+            const size_t object_layer_idx = overhang_layer - num_raft_layers;
+            if (object_layer_idx >= m_object->layer_count())
+                continue;
+
+            const Layer *object_layer = m_object->get_layer(int(object_layer_idx));
+            contacts.push_back({
+                state.result_on_layer,
+                TreeSupport3D::layer_z(m_slicing_params, config, size_t(state.layer_idx)),
+                object_layer->bottom_z(),
+                TreeSupport3D::support_element_radius(config, state),
+                object_layer->id()
+            });
+        }
+    }
+
+    std::sort(contacts.begin(), contacts.end(), [](const SupportContact &lhs, const SupportContact &rhs) {
+        return std::make_tuple(lhs.object_layer_id, lhs.position.x(), lhs.position.y(), lhs.support_tip_z,
+                               lhs.model_contact_z, lhs.nominal_radius) <
+               std::make_tuple(rhs.object_layer_id, rhs.position.x(), rhs.position.y(), rhs.support_tip_z,
+                               rhs.model_contact_z, rhs.nominal_radius);
+    });
+    m_object->m_support_contacts = std::move(contacts);
 }
 
 

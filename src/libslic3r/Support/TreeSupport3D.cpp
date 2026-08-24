@@ -3557,7 +3557,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             // ### draw these points as circles
             // this new function give correct result when raft is also enabled
             organic_draw_branches(
-                *print.get_object(processing.second.front()), volumes, config, move_bounds,
+                *print.get_object(processing.second.front()), *tree_support, volumes, config, move_bounds,
                 bottom_contacts, top_contacts, interface_placer, intermediate_layers, layer_storage,
                 throw_on_cancel);
 
@@ -3672,6 +3672,7 @@ static void recover_pending_branch_roofs(
 // Organic specific: Smooth branches and produce one cumulative mesh to be sliced.
 void organic_draw_branches(
     PrintObject                     &print_object,
+    TreeSupport                     &tree_support,
     TreeModelVolumes                &volumes, 
     const TreeSupportSettings       &config,
     std::vector<SupportElements>    &move_bounds,
@@ -3732,6 +3733,8 @@ void organic_draw_branches(
     throw_on_cancel();
 
     organic_smooth_branches_avoid_collisions(print_object, volumes, config, move_bounds, elements_with_link_down, linear_data_layers, throw_on_cancel);
+
+    tree_support.store_organic_support_contacts(elements_with_link_down, config);
 
     // Reduce memory footprint. After this point only finalize_interface_and_support_areas() will use volumes and from that only collisions with zero radius will be used.
     volumes.clear_all_but_object_collision();

@@ -19,6 +19,7 @@
 #endif /* WIN32 */
 
 #include <cstdio>
+#include <algorithm>
 #include <string>
 #include <cstring>
 #include <iostream>
@@ -5545,13 +5546,26 @@ int CLI::run(int argc, char **argv)
 
     // loop through action options
     bool export_to_3mf = false, load_slicedata = false, export_slicedata = false, export_slicedata_error = false;
+    const bool export_support_contacts = std::find(m_actions.begin(), m_actions.end(), "export_support_contacts") != m_actions.end();
     bool no_check = false;
     std::string export_3mf_file, load_slice_data_dir, export_slice_data_dir, export_stls_dir;
+    const std::string export_support_contacts_dir = export_support_contacts ? m_config.opt_string("export_support_contacts") : std::string{};
     std::vector<ThumbnailData*> calibration_thumbnails;
     std::vector<int> plate_object_count(partplate_list.get_plate_count(), 0);
     int max_slicing_time_per_plate = 0, max_triangle_count_per_plate = 0, sliced_plate = -1;
     std::vector<bool> plate_has_skips(partplate_list.get_plate_count(), false);
     std::vector<std::vector<size_t>> plate_skipped_objects(partplate_list.get_plate_count());
+
+    if (export_support_contacts && std::find(m_actions.begin(), m_actions.end(), "slice") == m_actions.end()) {
+        BOOST_LOG_TRIVIAL(error) << "--export-support-contacts requires headless slicing with --slice." << std::endl;
+        record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
+        flush_and_exit(CLI_INVALID_PARAMS);
+    }
+    if (export_support_contacts && printer_technology != ptFFF) {
+        BOOST_LOG_TRIVIAL(error) << "--export-support-contacts is available only for FFF slicing." << std::endl;
+        record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
+        flush_and_exit(CLI_INVALID_PARAMS);
+    }
 
     global_current_time = (long long)Slic3r::Utils::get_current_time_utc();
     sliced_info.prepare_time = (size_t) (global_current_time - global_begin_time);
@@ -5648,6 +5662,10 @@ int CLI::run(int argc, char **argv)
                 record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
                 flush_and_exit(CLI_INVALID_PARAMS);
             }
+        } else if (opt_key == "export_support_contacts") {
+            // Handled by the slicing action after the final Organic graph and
+            // G-code have both been generated. Pre-scanning makes CLI option
+            // order irrelevant.
         } else if (opt_key == "slice") {
             //BBS: slice 0 means all plates, i means plate i;
             plate_to_slice = m_config.option<ConfigOptionInt>("slice")->value;
@@ -6227,6 +6245,11 @@ int CLI::run(int argc, char **argv)
                                 const PrintConfig& print_config = print_fff->config();
                                 Model::setExtruderParams(m_print_config, filament_count);
                                 Model::setPrintSpeedTable(m_print_config, print_config);
+                                if (export_support_contacts) {
+                                    const std::string contact_error = print_fff->validate_support_contact_export();
+                                    if (!contact_error.empty())
+                                        throw Slic3r::InvalidArgument(contact_error);
+                                }
                                 if (load_slicedata) {
                                     std::string plate_dir = load_slice_data_dir+"/"+std::to_string(index+1);
                                     int ret = print->load_cached_data(plate_dir);
@@ -6353,6 +6376,12 @@ int CLI::run(int argc, char **argv)
                                 // Run the post-processing scripts if defined.
                                 //run_post_process_scripts(outfile, print->full_print_config());
                                 BOOST_LOG_TRIVIAL(info) << "Slicing result exported to " << outfile << std::endl;
+                                if (export_support_contacts) {
+                                    const boost::filesystem::path contact_path = boost::filesystem::path(export_support_contacts_dir) /
+                                        ("plate_" + std::to_string(index + 1) + ".support-contacts.json");
+                                    print_fff->export_support_contacts(contact_path.string(), size_t(index + 1));
+                                    BOOST_LOG_TRIVIAL(info) << "Support contacts exported to " << contact_path.string() << std::endl;
+                                }
                                 part_plate->update_slice_result_valid_state(true);
 #if defined(__linux__) || defined(__LINUX__)
                                 if (g_cli_callback_mgr.is_started()) {

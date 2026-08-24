@@ -11802,6 +11802,13 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->cli_params = "slicing_data_directory";
     def->set_default_value(new ConfigOptionString("cached_data"));
 
+    def = this->add("export_support_contacts", coString);
+    def->label = L("Export support contacts");
+    def->tooltip = L("Export realized discrete Organic support contacts to a folder.");
+    def->cli = "export-support-contacts";
+    def->cli_params = "directory";
+    def->set_default_value(new ConfigOptionString("."));
+
     def = this->add("load_slicedata", coStrings);
     def->label = L("Load slicing data");
     def->tooltip = L("Load cached slicing data from directory.");
