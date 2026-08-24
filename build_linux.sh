@@ -323,6 +323,7 @@ function run_in_docker() {
     local host_user
     local -a build_args
     local -a container_env
+    local -a container_runtime_env
 
     container_cli=$(resolve_container_cli)
     runner_image=$(get_docker_runner_image)
@@ -356,9 +357,16 @@ function run_in_docker() {
         container_env+=( -e "ORCA_UPDATER_SIG_KEY=${ORCA_UPDATER_SIG_KEY}" )
     fi
 
+    # Git Bash otherwise rewrites Linux container paths such as /__w into
+    # C:/Program Files/Git/__w before passing them to Docker Desktop.
+    container_runtime_env=()
+    case "$(uname -s)" in
+        MINGW*|MSYS*) container_runtime_env=(env MSYS_NO_PATHCONV=1) ;;
+    esac
+
     ensure_docker_runner_image "${container_cli}" "${runner_image}"
 
-    printf '%q ' "${container_cli}" run --rm -i \
+    printf '%q ' "${container_runtime_env[@]}" "${container_cli}" run --rm -i \
         -v "${SCRIPT_PATH}:${container_workspace}" \
         -w "${container_workspace}" \
         "${container_env[@]}" \
@@ -369,7 +377,7 @@ function run_in_docker() {
         return
     fi
 
-    "${container_cli}" run --rm -i \
+    "${container_runtime_env[@]}" "${container_cli}" run --rm -i \
         -v "${SCRIPT_PATH}:${container_workspace}" \
         -w "${container_workspace}" \
         "${container_env[@]}" \
@@ -407,10 +415,15 @@ function create_builder_user() {
 }
 
 create_builder_user
+sudo -H -u "${HOST_USER}" git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 mkdir -p "${GITHUB_WORKSPACE}/deps/build/destdir"
-chown -R "${HOST_UID}:${HOST_GID}" "${GITHUB_WORKSPACE}/deps/build"
+if ! sudo -H -u "${HOST_USER}" test -w "${GITHUB_WORKSPACE}/deps/build" ; then
+    chown -R "${HOST_UID}:${HOST_GID}" "${GITHUB_WORKSPACE}/deps/build"
+fi
 if [[ -d "${GITHUB_WORKSPACE}/build" ]] ; then
-    chown -R "${HOST_UID}:${HOST_GID}" "${GITHUB_WORKSPACE}/build"
+    if ! sudo -H -u "${HOST_USER}" test -w "${GITHUB_WORKSPACE}/build" ; then
+        chown -R "${HOST_UID}:${HOST_GID}" "${GITHUB_WORKSPACE}/build"
+    fi
 fi
 if [[ -d "${GITHUB_WORKSPACE}/build-dbg" ]] ; then
     chown -R "${HOST_UID}:${HOST_GID}" "${GITHUB_WORKSPACE}/build-dbg"
