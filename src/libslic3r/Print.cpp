@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#include <windows.h>
+#include <winnls.h>
+#endif
+
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"

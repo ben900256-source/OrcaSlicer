@@ -366,6 +366,8 @@ set(lisbslic3r_sources
     PrintObject.cpp
     PrintObjectSlice.cpp
     PrintRegion.cpp
+    PrintedScene.cpp
+    PrintedScene.hpp
     ProjectTask.cpp
     ProjectTask.hpp
     QuadricEdgeCollapse.cpp
@@ -454,6 +456,12 @@ set(lisbslic3r_sources
     Time.hpp
     Timer.cpp
     Timer.hpp
+    ToolEnvelope.cpp
+    ToolEnvelope.hpp
+    ToolEnvelopeCollision.cpp
+    ToolEnvelopeCollision.hpp
+    ToolpathClearanceValidator.cpp
+    ToolpathClearanceValidator.hpp
     TriangleMesh.cpp
     TriangleMesh.hpp
     TriangleMeshDeal.cpp
