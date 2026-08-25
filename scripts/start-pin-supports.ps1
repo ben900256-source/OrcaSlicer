@@ -128,8 +128,7 @@ $filamentPresets = @($filamentName, $filamentName, $filamentName, $filamentName,
 $filamentColors = @('#26A69A', '#26A69A', '#26A69A', '#26A69A', '#26A69A')
 $machineSettings = [ordered]@{
     machine = $machineName
-    printer = $machineName
-    print = $processName
+    process = $processName
     filament = $filamentName
     filament_01 = $filamentName
     filament_02 = $filamentName
@@ -148,21 +147,32 @@ $isolatedConfig = [ordered]@{
     models = @(
         [ordered]@{
             vendor = 'Prusa'
-            model = 'prusa_xl_5t_01'
+            model = 'Prusa XL 5T'
             nozzle_diameter = '0.4+0.25+0.4+0.4+0.4'
         }
     )
     presets = [ordered]@{
-        printer = $machineName
-        filaments = $filamentPresets
+        machine = $machineName
     }
     orca_presets = @($machineSettings)
 }
 
 $configPath = Join-Path $DataDir 'OrcaSlicer.conf'
-$configJson = $isolatedConfig | ConvertTo-Json -Depth 8
+$configJson = ($isolatedConfig | ConvertTo-Json -Depth 8) -replace "`r`n", "`n"
 $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($configPath, $configJson, $utf8WithoutBom)
+$md5 = [System.Security.Cryptography.MD5]::Create()
+try {
+    $digest = $md5.ComputeHash($utf8WithoutBom.GetBytes($configJson))
+}
+finally {
+    $md5.Dispose()
+}
+
+# Match OrcaSlicer's Windows config trailer so AppConfig can safely split and
+# verify the generated file during startup.
+$checksum = ($digest | ForEach-Object { $_.ToString('X2') }) -join ''
+$configContents = "$configJson`n# MD5 checksum $checksum`n"
+[System.IO.File]::WriteAllText($configPath, $configContents, $utf8WithoutBom)
 Write-Output "Initialized isolated selections in '$configPath'."
 
 # Start-Process joins ArgumentList into a Windows command line. Quote path values
