@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 
 namespace Slic3r {
@@ -45,8 +45,10 @@ void validate_scaled_coordinate(double value, const std::string &field)
 void add_stats(PrintedSceneQueryStats &target, const PrintedSceneQueryStats &source)
 {
     target.visited_cells += source.visited_cells;
+    target.references_examined += source.references_examined;
     target.candidate_count += source.candidate_count;
     target.exact_count += source.exact_count;
+    target.sweep_subdivisions += source.sweep_subdivisions;
 }
 
 bool vertical_intersects(double first_min, double first_max, double second_min, double second_max)
@@ -60,9 +62,9 @@ double signed_vertical_clearance(double first_min,
                                  double second_max)
 {
     if (first_min > second_max)
-        return first_min - second_max;
+        return first_min - second_max - EPSILON;
     if (second_min > first_max)
-        return second_min - first_max;
+        return second_min - first_max - EPSILON;
     return -std::max(0.0, std::min(first_max, second_max) - std::max(first_min, second_min));
 }
 
@@ -115,15 +117,17 @@ std::string diagnostic_for(const ToolClearanceResult &result)
         message << " ('" << result.slice_name << "')";
     message << " in zone " << tool_envelope_zone_name(result.zone)
             << " collides with deposited primitive " << result.primitive_id
-            << " (sequence " << result.obstacle_sequence << ") at t="
-            << result.first_hit_t;
+            << " (sequence " << result.obstacle_sequence << ") in t=["
+            << result.t_lower << ", " << result.t_upper << "]";
     return message.str();
 }
 
 bool hit_less(const ToolClearanceResult &left, const ToolClearanceResult &right)
 {
-    if (left.first_hit_t != right.first_hit_t)
-        return left.first_hit_t < right.first_hit_t;
+    if (left.t_lower != right.t_lower)
+        return left.t_lower < right.t_lower;
+    if (left.t_upper != right.t_upper)
+        return left.t_upper < right.t_upper;
     if (left.obstacle_sequence != right.obstacle_sequence)
         return left.obstacle_sequence < right.obstacle_sequence;
     if (left.primitive_id != right.primitive_id)
@@ -133,46 +137,89 @@ bool hit_less(const ToolClearanceResult &left, const ToolClearanceResult &right)
     return left.obstacle_index < right.obstacle_index;
 }
 
-void merge_obstacle_hit(std::unordered_map<std::size_t, ToolClearanceResult> &hits,
-                        ToolClearanceResult hit)
+void finalize_contacts(std::vector<ToolClearanceResult> &contacts,
+                       const PrintedSceneQueryStats &stats)
 {
-    const auto found = hits.find(hit.obstacle_index);
-    if (found == hits.end()) {
-        hits.emplace(hit.obstacle_index, std::move(hit));
-        return;
+    for (ToolClearanceResult &contact : contacts) {
+        contact.first_hit_t = contact.t_lower;
+        contact.last_hit_t = contact.t_upper;
+        contact.query_stats = stats;
+        contact.diagnostic = diagnostic_for(contact);
     }
-
-    ToolClearanceResult &current = found->second;
-    const double required_raise = std::max(current.required_z_raise_mm, hit.required_z_raise_mm);
-    const double last_hit = std::max(current.last_hit_t, hit.last_hit_t);
-    if (hit_less(hit, current))
-        current = std::move(hit);
-    current.required_z_raise_mm = required_raise;
-    current.last_hit_t = last_hit;
+    std::sort(contacts.begin(), contacts.end(), hit_less);
 }
 
-std::vector<ToolClearanceResult> collect_sorted_hits(
-    std::unordered_map<std::size_t, ToolClearanceResult> hits,
-    const PrintedSceneQueryStats &stats)
+class CancellationPoller
 {
-    std::vector<ToolClearanceResult> result;
-    result.reserve(hits.size());
-    for (auto &item : hits) {
-        item.second.query_stats = stats;
-        item.second.diagnostic = diagnostic_for(item.second);
-        result.emplace_back(std::move(item.second));
+public:
+    explicit CancellationPoller(const ToolCollisionCancellation &cancel) : m_cancel(cancel) {}
+
+    void poll()
+    {
+        if (m_cancel && (++m_work & 0xffu) == 0)
+            m_cancel();
     }
-    std::sort(result.begin(), result.end(), hit_less);
-    return result;
+
+    void force() const
+    {
+        if (m_cancel)
+            m_cancel();
+    }
+
+private:
+    const ToolCollisionCancellation &m_cancel;
+    std::size_t m_work { 0 };
+};
+
+using CapsuleKey = std::pair<std::size_t, double>;
+using CapsuleCache = std::map<CapsuleKey, Polygons>;
+
+const Polygons &cached_capsule(CapsuleCache &cache,
+                               const PrintedScene &scene,
+                               std::size_t obstacle_index,
+                               double margin_mm)
+{
+    const CapsuleKey key { obstacle_index, margin_mm };
+    auto found = cache.find(key);
+    if (found == cache.end())
+        found = cache.emplace(key, obstacle_capsule(scene.segment(obstacle_index), margin_mm)).first;
+    return found->second;
 }
 
-struct SweepHitAccumulator {
+struct SweepContact {
     bool   hit { false };
-    double first_t { 1.0 };
-    double last_t { 0.0 };
+    double t_lower { 1.0 };
+    double t_upper { 1.0 };
     double signed_clearance { std::numeric_limits<double>::infinity() };
     double required_raise { 0.0 };
+    std::size_t subdivisions { 0 };
 };
+
+std::optional<std::pair<double, double>> z_overlap_interval(
+    const ToolEnvelopeSlice &slice,
+    const PrintedScene::PrimitiveBounds &obstacle_bounds,
+    const Vec3d &start_pose,
+    const Vec3d &end_pose)
+{
+    const double lower_z = obstacle_bounds.z_min_mm - slice.z_max_mm() - EPSILON;
+    const double upper_z = obstacle_bounds.z_max_mm - slice.z_min_mm() + EPSILON;
+    const double delta_z = end_pose.z() - start_pose.z();
+    if (delta_z == 0.0) {
+        if (start_pose.z() < lower_z || start_pose.z() > upper_z)
+            return std::nullopt;
+        return std::pair<double, double> { 0.0, 1.0 };
+    }
+
+    double t0 = (lower_z - start_pose.z()) / delta_z;
+    double t1 = (upper_z - start_pose.z()) / delta_z;
+    if (t0 > t1)
+        std::swap(t0, t1);
+    t0 = std::max(0.0, t0);
+    t1 = std::min(1.0, t1);
+    if (t0 > t1)
+        return std::nullopt;
+    return std::pair<double, double> { t0, t1 };
+}
 
 bool interval_xy_possible(const ToolEnvelopeSlice &slice,
                           const Polygons &capsule,
@@ -196,56 +243,93 @@ bool interval_xy_possible(const ToolEnvelopeSlice &slice,
     return xy_intersects(enclosure, capsule);
 }
 
-SweepHitAccumulator sweep_slice_against_obstacle(const ToolEnvelopeSlice &slice,
-                                                 const DepositedSegment &obstacle,
-                                                 const PrintedScene::PrimitiveBounds &obstacle_bounds,
-                                                 const Vec3d &start_pose,
-                                                 const Vec3d &end_pose,
-                                                 double margin_mm)
+SweepContact sweep_slice_against_obstacle(const ToolEnvelopeSlice &slice,
+                                          const Polygons &capsule,
+                                          const PrintedScene::PrimitiveBounds &obstacle_bounds,
+                                          const Vec3d &start_pose,
+                                          const Vec3d &end_pose,
+                                          CancellationPoller &cancellation,
+                                          double stop_after_t = 1.0)
 {
-    const Polygons capsule = obstacle_capsule(obstacle, margin_mm);
-    SweepHitAccumulator accumulator;
+    SweepContact contact;
+    const auto z_interval = z_overlap_interval(slice, obstacle_bounds, start_pose, end_pose);
+    if (!z_interval)
+        return contact;
+
     const Vec3d delta = end_pose - start_pose;
     const double xy_distance = delta.head<2>().norm();
-    const double z_distance = std::abs(delta.z());
+    const double initial_t0 = z_interval->first;
+    const double initial_t1 = std::min(z_interval->second, stop_after_t);
+    if (initial_t0 > initial_t1)
+        return contact;
 
-    std::function<void(double, double, unsigned)> visit;
+    std::function<bool(double, double, unsigned)> visit;
     visit = [&](double t0, double t1, unsigned depth) {
-        const double z0 = start_pose.z() + delta.z() * t0;
-        const double z1 = start_pose.z() + delta.z() * t1;
-        const double slice_z_min = std::min(z0, z1) + slice.z_min_mm();
-        const double slice_z_max = std::max(z0, z1) + slice.z_max_mm();
-        if (!vertical_intersects(slice_z_min, slice_z_max,
-                                 obstacle_bounds.z_min_mm, obstacle_bounds.z_max_mm))
-            return;
+        cancellation.poll();
+        if (contact.hit || t0 > stop_after_t)
+            return contact.hit;
+        if (t1 > stop_after_t)
+            t1 = stop_after_t;
+        if (t0 > t1)
+            return false;
         if (!interval_xy_possible(slice, capsule, start_pose, end_pose, t0, t1))
-            return;
+            return false;
 
         const double interval = t1 - t0;
-        const bool resolved = xy_distance * interval <= RESOLUTION &&
-                              z_distance * interval <= EPSILON;
-        if (resolved || depth >= 32) {
-            const double clearance = signed_vertical_clearance(
-                slice_z_min, slice_z_max, obstacle_bounds.z_min_mm, obstacle_bounds.z_max_mm);
-            const double required_raise = std::max(
-                0.0, obstacle_bounds.z_max_mm - slice_z_min + EPSILON);
-            if (!accumulator.hit) {
-                accumulator.hit = true;
-                accumulator.first_t = t0;
-                accumulator.signed_clearance = clearance;
-            }
-            accumulator.last_t = std::max(accumulator.last_t, t1);
-            accumulator.required_raise = std::max(accumulator.required_raise, required_raise);
-            return;
+        if (xy_distance * interval <= RESOLUTION || depth >= 32) {
+            const double z0 = start_pose.z() + delta.z() * t0;
+            const double z1 = start_pose.z() + delta.z() * t1;
+            const double slice_z_min = std::min(z0, z1) + slice.z_min_mm();
+            const double slice_z_max = std::max(z0, z1) + slice.z_max_mm();
+            contact.hit = true;
+            contact.t_lower = t0;
+            contact.t_upper = t1;
+            contact.signed_clearance = std::min(0.0, signed_vertical_clearance(
+                slice_z_min, slice_z_max, obstacle_bounds.z_min_mm, obstacle_bounds.z_max_mm));
+            const double boundary_raise = std::max(
+                0.0, obstacle_bounds.z_max_mm + EPSILON - slice_z_min);
+            contact.required_raise = std::nextafter(
+                boundary_raise, std::numeric_limits<double>::infinity());
+            return true;
         }
 
+        ++contact.subdivisions;
         const double midpoint = (t0 + t1) * 0.5;
-        visit(t0, midpoint, depth + 1);
-        visit(midpoint, t1, depth + 1);
+        if (visit(t0, midpoint, depth + 1))
+            return true;
+        return visit(midpoint, t1, depth + 1);
     };
 
-    visit(0.0, 1.0, 0);
-    return accumulator;
+    visit(initial_t0, initial_t1, 0);
+    return contact;
+}
+
+bool interval_xy_overlaps_obstacle(const ToolEnvelopeSlice &slice,
+                                   const Polygons &capsule,
+                                   const Vec3d &start_pose,
+                                   const Vec3d &end_pose)
+{
+    return interval_xy_possible(slice, capsule, start_pose, end_pose, 0.0, 1.0);
+}
+
+std::vector<std::pair<double, double>> merged_intervals(
+    std::vector<std::pair<double, double>> intervals)
+{
+    intervals.erase(std::remove_if(intervals.begin(), intervals.end(), [](const auto &interval) {
+        return interval.second < 0.0;
+    }), intervals.end());
+    for (auto &interval : intervals)
+        interval.first = std::max(0.0, interval.first);
+    std::sort(intervals.begin(), intervals.end());
+    std::vector<std::pair<double, double>> merged;
+    for (const auto &interval : intervals) {
+        if (merged.empty() || interval.first > merged.back().second) {
+            merged.push_back(interval);
+        } else {
+            merged.back().second = std::max(merged.back().second, interval.second);
+        }
+    }
+    return merged;
 }
 
 } // namespace

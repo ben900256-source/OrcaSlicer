@@ -36,8 +36,10 @@ struct DepositedSegment {
 
 struct PrintedSceneQueryStats {
     std::size_t visited_cells { 0 };
+    std::size_t references_examined { 0 };
     std::size_t candidate_count { 0 };
     std::size_t exact_count { 0 };
+    std::size_t sweep_subdivisions { 0 };
 };
 
 using PrintedSceneQueryStatistics = PrintedSceneQueryStats;
@@ -46,6 +48,7 @@ class PrintedScene
 {
 public:
     static constexpr double GRID_CELL_SIZE_MM = 5.0;
+    static constexpr double GRID_Z_SLAB_SIZE_MM = 1.0;
 
     struct PrimitiveBounds {
         double min_x_mm { 0.0 };
@@ -81,6 +84,18 @@ public:
                                            double z_max_mm,
                                            PrintedSceneQueryStats *stats = nullptr) const;
 
+    // Broad-phase query for a translated volume. Bounds are local to the
+    // supplied poses. A sparse corridor keeps long diagonal sweeps linear.
+    std::vector<std::size_t> query_sweep_indices(const Vec3d &start_pose_mm,
+                                                 const Vec3d &end_pose_mm,
+                                                 double local_min_x_mm,
+                                                 double local_min_y_mm,
+                                                 double local_max_x_mm,
+                                                 double local_max_y_mm,
+                                                 double local_z_min_mm,
+                                                 double local_z_max_mm,
+                                                 PrintedSceneQueryStats *stats = nullptr) const;
+
     std::vector<std::size_t> brute_force_query_indices(double min_x_mm,
                                                        double min_y_mm,
                                                        double max_x_mm,
@@ -92,8 +107,15 @@ private:
     struct Cell {
         std::int64_t x;
         std::int64_t y;
+        std::int64_t z;
 
-        bool operator==(const Cell &other) const noexcept { return x == other.x && y == other.y; }
+        bool operator==(const Cell &other) const noexcept { return x == other.x && y == other.y && z == other.z; }
+        bool operator<(const Cell &other) const noexcept
+        {
+            if (z != other.z) return z < other.z;
+            if (y != other.y) return y < other.y;
+            return x < other.x;
+        }
     };
 
     struct CellHash {
@@ -101,7 +123,26 @@ private:
     };
 
     static PrimitiveBounds calculate_bounds(const DepositedSegment &segment);
-    static std::int64_t     cell_coordinate(double value_mm);
+    static std::int64_t     xy_cell_coordinate(double value_mm);
+    static std::int64_t     z_cell_coordinate(double value_mm);
+    static std::vector<Cell> centerline_cells(const Vec3d &start, const Vec3d &end);
+    static void append_padded_cells(std::vector<Cell> &target,
+                                    const std::vector<Cell> &centerline,
+                                    std::int64_t min_dx,
+                                    std::int64_t max_dx,
+                                    std::int64_t min_dy,
+                                    std::int64_t max_dy,
+                                    std::int64_t min_dz,
+                                    std::int64_t max_dz);
+
+    std::vector<std::size_t> query_cells(std::vector<Cell> cells,
+                                         double min_x_mm,
+                                         double min_y_mm,
+                                         double max_x_mm,
+                                         double max_y_mm,
+                                         double z_min_mm,
+                                         double z_max_mm,
+                                         PrintedSceneQueryStats *stats) const;
 
     std::vector<DepositedSegment> m_segments;
     std::vector<PrimitiveBounds>  m_bounds;
