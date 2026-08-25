@@ -2,6 +2,7 @@
 
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupport.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
@@ -11,9 +12,13 @@
 #include "test_utils.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <set>
+#include <sstream>
 #include <tuple>
 #include <vector>
 
@@ -414,4 +419,118 @@ TEST_CASE("Existing Organic controls realize sparse contact spacing", "[SupportM
     CHECK_THAT(spacing_2.median_distance, Catch::Matchers::WithinAbs(2., 0.4));
     CHECK_THAT(spacing_3.median_distance, Catch::Matchers::WithinAbs(3., 0.6));
     CHECK_THAT(spacing_4.median_distance, Catch::Matchers::WithinAbs(4., 0.8));
+}
+
+TEST_CASE("Prusa XL miniature profiles slice Pin fixtures only with physical tool 2", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    static constexpr const char *machine_name = "Prusa XL 5T T2 0.25 nozzle (others 0.4)";
+    static constexpr const char *filament_name = "Prusa Generic Miniature PLA @XL 5T";
+    const std::array<const char *, 2> process_names {
+        "0.05mm Miniature Ultra Detail + Pin @Prusa XL 5T T2 0.25",
+        "0.06mm Miniature Balanced + Pin @Prusa XL 5T T2 0.25"
+    };
+
+    PresetBundle bundle;
+    bundle.set_is_validation_mode(true);
+    REQUIRE(bundle.load_vendor_configs_from_json(
+                PROFILES_DIR, "Prusa", PresetBundle::LoadSystem,
+                ForwardCompatibilitySubstitutionRule::EnableSilent).second > 0);
+
+    Preset *machine = bundle.printers.find_preset(machine_name, false, true);
+    Preset *filament = bundle.filaments.find_preset(filament_name, false, true);
+    REQUIRE(machine != nullptr);
+    REQUIRE(filament != nullptr);
+
+    for (const char *process_name : process_names) {
+        DYNAMIC_SECTION(process_name) {
+            Preset *process = bundle.prints.find_preset(process_name, false, true);
+            REQUIRE(process != nullptr);
+
+            DynamicPrintConfig project_config = bundle.project_config;
+            project_config.option<ConfigOptionInts>("filament_map", true)->values = { 1, 1, 1, 1, 1 };
+            project_config.option<ConfigOptionInts>("filament_nozzle_map", true)->values = { 0, 0, 0, 0, 0 };
+            project_config.option<ConfigOptionInts>("filament_volume_map", true)->values = { 0, 0, 0, 0, 0 };
+            project_config.option<ConfigOptionStrings>("filament_colour", true)->values = {
+                "#26A69A", "#26A69A", "#26A69A", "#26A69A", "#26A69A"
+            };
+            project_config.option<ConfigOptionFloats>("flush_multiplier", true)->values = { 0.3 };
+            project_config.option<ConfigOptionFloats>("flush_volumes_matrix", true)->values.assign(25, 0.);
+            std::vector<Preset> selected_filaments(5, *filament);
+            DynamicPrintConfig config = PresetBundle::construct_full_config(
+                *machine, *process, project_config, selected_filaments, true, std::nullopt);
+
+            TriangleMesh coupon = load_model("support_contact_coupon.obj");
+            coupon.scale(Vec3f(1.f, 1.f, 0.25f));
+            Print print;
+            Model model;
+            init_print({ std::move(coupon) }, print, model, config);
+            print.process();
+
+            const PrintObject &object = *print.objects().front();
+            REQUIRE(object.support_contacts().size() > 1);
+            const std::vector<ContactSignature> signatures = contact_signatures(object);
+            CHECK(std::is_sorted(signatures.begin(), signatures.end()));
+            CHECK_THAT(median_nearest_neighbour_distance(object.support_contacts()),
+                       Catch::Matchers::WithinAbs(3., 0.6));
+            CHECK(print.validate_support_contact_export().empty());
+
+            TriangleMesh repeated_coupon = load_model("support_contact_coupon.obj");
+            repeated_coupon.scale(Vec3f(1.f, 1.f, 0.25f));
+            Print repeated_print;
+            Model repeated_model;
+            init_print({ std::move(repeated_coupon) }, repeated_print, repeated_model, config);
+            repeated_print.process();
+            CHECK(contact_signatures(*repeated_print.objects().front()) == signatures);
+
+            ScopedTemporaryFile report_file(".support-contacts.json");
+            print.export_support_contacts(report_file.string(), 0);
+            std::ifstream report_stream(report_file.string());
+            const nlohmann::json report = nlohmann::json::parse(report_stream);
+            CHECK(report.at("schema_version") == 1);
+            CHECK(report.at("contact_count") == object.support_contacts().size());
+
+            ScopedTemporaryFile repeated_report_file(".support-contacts.json");
+            repeated_print.export_support_contacts(repeated_report_file.string(), 0);
+            std::ifstream repeated_report_stream(repeated_report_file.string());
+            nlohmann::json repeated_report = nlohmann::json::parse(repeated_report_stream);
+            nlohmann::json normalized_report = report;
+            for (nlohmann::json *candidate : { &normalized_report, &repeated_report }) {
+                for (nlohmann::json &instance : candidate->at("instances")) {
+                    instance.erase("object_id");
+                    instance.erase("instance_id");
+                }
+            }
+            CHECK(repeated_report == normalized_report);
+
+            TriangleMesh miniature_fixture = mesh(TestMesh::overhang);
+            miniature_fixture.scale(Vec3f(0.2f, 0.2f, 0.25f));
+            Print miniature_print;
+            Model miniature_model;
+            init_print({ std::move(miniature_fixture) }, miniature_print, miniature_model, config);
+            miniature_print.process();
+            CHECK_FALSE(miniature_print.objects().front()->support_contacts().empty());
+            CHECK(miniature_print.validate_support_contact_export().empty());
+
+            const std::string generated = gcode(print);
+            CHECK_FALSE(generated.empty());
+            CHECK_FALSE(layers_with_role(generated, "support").empty());
+            CHECK(layers_with_role(generated, "support interface").empty());
+            CHECK(generated.find("M900 K0.14") != std::string::npos);
+            CHECK(generated.find("M572 S0.12") != std::string::npos);
+
+            std::set<int> selected_tools;
+            std::istringstream lines(generated);
+            for (std::string line; std::getline(lines, line);) {
+                if (line.size() < 2 || line.front() != 'T' || !std::isdigit(static_cast<unsigned char>(line[1])))
+                    continue;
+                size_t consumed = 0;
+                const int tool = std::stoi(line.substr(1), &consumed);
+                if (consumed > 0 && (consumed + 1 == line.size() || std::isspace(static_cast<unsigned char>(line[consumed + 1]))))
+                    selected_tools.insert(tool);
+            }
+            CHECK(selected_tools == std::set<int>{ 1 });
+            REQUIRE(print.get_filament_maps().size() >= 2);
+            CHECK(print.get_filament_maps()[1] == 2);
+        }
+    }
 }
