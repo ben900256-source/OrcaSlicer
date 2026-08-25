@@ -11,6 +11,14 @@ set(_python_sha256 "c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207
 set(_patch_cmd "")
 if(WIN32)
 
+    # CMake's process launcher does not reliably resolve the cmd shell by its
+    # bare name (notably with CMake 4.4), even though cmd.exe is available via
+    # ComSpec. Use its absolute path for the configure and build steps.
+    set(_python_cmd "$ENV{ComSpec}")
+    if(NOT _python_cmd OR NOT EXISTS "${_python_cmd}")
+        find_program(_python_cmd NAMES cmd.exe REQUIRED)
+    endif()
+
     # Fix python build failure on Windows if python is not available, due to wrong nuget download URL
     # See https://github.com/python/cpython/issues/153438
     # Patch from https://github.com/python/cpython/pull/153608
@@ -86,11 +94,11 @@ if(WIN32)
     endif()
 
     set(_conf_cmd
-        cmd /c "echo /p:PlatformToolset=${_python_platform_toolset}>PCbuild\\msbuild.rsp"
+        "${_python_cmd}" /c "echo /p:PlatformToolset=${_python_platform_toolset}>PCbuild\\msbuild.rsp"
     )
     set(_build_cmd
         ${CMAKE_COMMAND} -E env ${_python_env_args}
-        cmd /c PCbuild\\build.bat
+        "${_python_cmd}" /c PCbuild\\build.bat
             -p ${_python_pcbuild_platform}
             -c ${_python_pcbuild_config}
             --no-tkinter
