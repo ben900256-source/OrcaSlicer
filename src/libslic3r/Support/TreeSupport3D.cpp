@@ -3855,9 +3855,10 @@ void organic_draw_branches(
     const SlicingParameters &slicing_params = print_object.slicing_parameters();
     MeshSlicingParams mesh_slicing_params;
     mesh_slicing_params.mode = MeshSlicingParams::SlicingMode::Positive;
+    const bool round_tip = print_object.config().tree_support_round_tip.value;
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
-        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel, round_tip](const tbb::blocked_range<size_t> &range) {
             indexed_triangle_set    partial_mesh;
             std::vector<float>      slice_z;
             std::vector<Polygons>   bottom_contacts;
@@ -3885,6 +3886,26 @@ void organic_draw_branches(
                     // ORCA: guard against empty slices from meshing.
                     if (slices.empty())
                         continue;
+
+                    if (round_tip && branch.has_tip) {
+                        // A tube cut by a horizontal layer is elliptical when the branch is
+                        // inclined. Pin supports need discrete round terminal footprints, so
+                        // replace only the final two cuts at their collision-planned centers.
+                        // The path planner limits movement between adjacent centers; retaining
+                        // two circles keeps them overlapped with each other and with the
+                        // untouched tube below. Collision and bed clipping still run afterward.
+                        const size_t num_round_layers = std::min<size_t>(2, branch.path.size());
+                        for (size_t distance_to_tip = 0; distance_to_tip < num_round_layers; ++ distance_to_tip) {
+                            const SupportElement &element = *branch.path[branch.path.size() - 1 - distance_to_tip];
+                            const LayerIndex circular_layer = element.state.layer_idx;
+                            if (circular_layer < layer_begin || circular_layer >= layer_begin + LayerIndex(slices.size()))
+                                continue;
+
+                            Polygon circle = make_circle(support_element_radius(config, element), SUPPORT_TREE_CIRCLE_RESOLUTION);
+                            circle.translate(element.state.result_on_layer);
+                            slices[circular_layer - layer_begin] = Polygons{ std::move(circle) };
+                        }
+                    }
 
                     bottom_contacts.clear();
                     // ORCA: trim tiny fragments to reduce degenerate polygon booleans.

@@ -7093,6 +7093,14 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.8));
 
+    def = this->add("tree_support_round_tip", coBool);
+    def->label = L("Round branch tips");
+    def->category = L("Support");
+    def->tooltip = L("Replace the final two horizontal slices of an Organic support branch with circles centered on its planned path. "
+                     "This keeps small discrete contacts round while preserving the normal branch below them.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def           = this->add("tree_support_branch_diameter", coFloat);
     def->label    = L("Tree support branch diameter");
     def->category = L("Support");

@@ -1329,6 +1329,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "tree_support_branch_distance"
             || opt_key == "tree_support_branch_distance_organic"
             || opt_key == "tree_support_tip_diameter"
+            || opt_key == "tree_support_round_tip"
             || opt_key == "tree_support_branch_diameter"
             || opt_key == "tree_support_branch_diameter_organic"
             || opt_key == "tree_support_branch_diameter_angle"

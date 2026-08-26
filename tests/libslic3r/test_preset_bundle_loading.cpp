@@ -672,6 +672,9 @@ TEST_CASE("Prusa XL miniature Pin profiles resolve to the mixed-nozzle tool", "[
         CHECK_FALSE(profile->config.opt_bool("support_on_build_plate_only"));
         CHECK(profile->config.opt_int("support_interface_top_layers") == 0);
         CHECK(profile->config.opt_int("support_interface_bottom_layers") == 0);
+        CHECK(profile->config.opt_bool("tree_support_round_tip"));
+        CHECK_THAT(profile->config.opt_float("tree_support_angle_slow"),
+                   Catch::Matchers::WithinAbs(25.0, 1e-9));
         CHECK_THAT(profile->config.opt_float("tree_support_branch_distance_organic"),
                    Catch::Matchers::WithinAbs(3.0, 1e-9));
         for (const char *key : tool_routed_options) {

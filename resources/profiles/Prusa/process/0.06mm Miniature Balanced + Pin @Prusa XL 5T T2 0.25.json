@@ -15,6 +15,7 @@
 	"support_top_z_distance": "0.18",
 	"support_line_width": "0.4",
 	"tree_support_tip_diameter": "0.4",
+	"tree_support_round_tip": "1",
 	"tree_support_branch_diameter_organic": "2",
 	"tree_support_branch_diameter_angle": "5",
 	"tree_support_branch_distance_organic": "3",
