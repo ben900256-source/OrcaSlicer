@@ -24,7 +24,7 @@ The source profile was made for different hardware. This fork reuses its geometr
 | Adhesion and precision | 2-loop skirt, 6 mm outer brim, reduced wall crossing, curled-perimeter slowdown, 0.001 mm slicing resolution | Applied through a hidden cross-printer base |
 | Supports | Automatic Organic supports | Supports are allowed everywhere, including model-supported islands |
 | Pin contact | Community interface geometry replaced | No interface layers; opt-in round final two tip slices; 0.4 mm support width/tip, 2 mm branches, 5 degree diameter angle, 3 mm branch distance, 13.33% density |
-| Layer variants | 0.06 mm source baseline | 0.06 mm Balanced uses 0.18 mm top Z distance; 0.05 mm Ultra Detail uses 0.15 mm |
+| Layer variants | 0.06 mm source baseline | Experimental one-layer contact clearance: 0.06 mm for Balanced and 0.05 mm for Ultra Detail |
 | Extrusion roles | Not retained | Walls, infill, solid/top/bottom surfaces, bridges through their owning roles, and support base/interface are fixed to tool 2 |
 | Filament | Generic PLA starting point | 3 mm³/s cap, full cooling, and tool-index-aware XL pressure-advance G-code |
 
@@ -39,12 +39,10 @@ Prusa documents printing with different XL nozzle diameters as [experimental](ht
 
 The firmware and G-code use zero-based tool commands, so physical tool 2 is emitted as `T1` in G-code.
 
-Do not call the profiles print-proven until a supervised physical coupon has confirmed contact removal and surface quality on the prepared machine.
+Do not call the profiles print-proven until a supervised physical coupon has confirmed island survival, underside quality, removal force, and surface marking on the prepared machine.
 
-## Breakaway-gap trial
+## Experimental one-layer clearance
 
-The built-in values remain the three-layer baseline: 0.15 mm for 0.05 mm Ultra Detail and 0.18 mm for 0.06 mm Balanced. Do not use a zero gap with same-material PLA supports.
+The built-in values use one configured layer of top Z clearance: 0.05 mm for Ultra Detail and 0.06 mm for Balanced. This is an experimental resin-style contact baseline for sparse Organic branches with small round breakaway tips, not a claim that FFF contacts behave like cured resin. The gap remains nonzero because the model and supports use the same PLA.
 
-Before reducing the built-in values, print a paired plate for each profile with alternating, spatially separated groups of at least six identical supported features per condition. Compare the baseline against 0.10 mm Ultra Detail or 0.12 mm Balanced (two layers), using the same dried PLA, tool 2, cooling, and calibration. Record island survival, underside sag/stringing/sharpness under identical lighting, removal force, and nubs, pits, whitening, or torn material.
-
-Adopt two layers only if every model feature survives, no contact damages the model, median removal needs no more than pliers, scarring is no worse, and most matched undersides visibly improve. Repeat once if the result is tied or affected by an unrelated defect. Test 0.05 mm Ultra Detail or 0.06 mm Balanced (one layer) only when two layers remove cleanly but sag remains unacceptable, using the same acceptance criteria.
+Before using either profile for production miniatures, print a supervised physical coupon with at least six identical supported features using the same dried PLA, tool 2, cooling, and calibration planned for the model. Confirm that every island survives, inspect underside sag, stringing, and sharpness under consistent lighting, record the force and tools needed for removal, and check every contact for nubs, pits, whitening, or torn material. Increase the clearance if contacts fuse or mark the model, and repeat the coupon after any material, temperature, cooling, or calibration change.

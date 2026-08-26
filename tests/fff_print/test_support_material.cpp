@@ -575,7 +575,7 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
     };
 
     for (const auto &[layer_height, top_gap] : std::array<std::pair<double, double>, 2>{
-             std::pair{ 0.05, 0.15 }, std::pair{ 0.06, 0.18 } }) {
+             std::pair{ 0.05, 0.05 }, std::pair{ 0.06, 0.06 } }) {
         DYNAMIC_SECTION("layer height " << layer_height) {
             const SliceResult baseline  = slice_coupon(layer_height, top_gap, false);
             const SliceResult candidate = slice_coupon(layer_height, top_gap, true);
@@ -626,7 +626,7 @@ TEST_CASE("Organic Pin contact Z matches one two and three layer gaps", "[Suppor
                    Catch::Matchers::WithinAbs(top_gap, 1e-6));
 }
 
-TEST_CASE("Prusa XL miniature profiles slice Pin fixtures only with physical tool 2", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+TEST_CASE("Prusa XL miniature profiles realize one-layer Pin contacts on physical tool 2", "[SupportMaterial][OrganicContacts][MiniaturePin]")
 {
     static constexpr const char *machine_name = "Prusa XL 5T T2 0.25 nozzle (others 0.4)";
     static constexpr const char *filament_name = "Prusa Generic Miniature PLA @XL 5T";
@@ -666,6 +666,9 @@ TEST_CASE("Prusa XL miniature profiles slice Pin fixtures only with physical too
             CHECK(config.opt_bool("tree_support_round_tip"));
             CHECK_THAT(config.opt_float("tree_support_angle_slow"),
                        Catch::Matchers::WithinAbs(25.0, 1e-9));
+            const double layer_height = config.opt_float("layer_height");
+            CHECK_THAT(config.opt_float("support_top_z_distance"),
+                       Catch::Matchers::WithinAbs(layer_height, 1e-9));
 
             TriangleMesh coupon = load_model("support_contact_coupon.obj");
             coupon.scale(Vec3f(1.f, 1.f, 0.25f));
@@ -676,6 +679,9 @@ TEST_CASE("Prusa XL miniature profiles slice Pin fixtures only with physical too
 
             const PrintObject &object = *print.objects().front();
             REQUIRE(object.support_contacts().size() > 1);
+            for (const SupportContact &contact : object.support_contacts())
+                CHECK_THAT(contact.model_contact_z - contact.support_tip_z,
+                           Catch::Matchers::WithinAbs(layer_height, 1e-6));
             const std::vector<ContactSignature> signatures = contact_signatures(object);
             CHECK(std::is_sorted(signatures.begin(), signatures.end()));
             CHECK_THAT(median_nearest_neighbour_distance(object.support_contacts()),
