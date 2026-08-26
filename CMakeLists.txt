@@ -4,6 +4,17 @@ endif()
 
 cmake_minimum_required(VERSION 3.13)
 
+# Fast development builds use CMake's MSVC debug-information abstraction to
+# select /Z7. CMP0141 and this variable must be set before project() enables
+# the compiler, so inspect the cache value before declaring the option below.
+if (ORCA_FAST_DEV)
+    if (CMAKE_VERSION VERSION_LESS "3.25")
+        message(FATAL_ERROR "ORCA_FAST_DEV requires CMake 3.25 or newer")
+    endif ()
+    cmake_policy(SET CMP0141 NEW)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+endif ()
+
 
 # The following line used to be in tests/CMakeLists.txt
 # Having it there causes rebuilds of all targets on any CMakeLists.txt change under tests/
@@ -129,6 +140,11 @@ option(SLIC3R_PCH               "Use precompiled headers" 1)
 option(SLIC3R_MSVC_COMPILE_PARALLEL "Compile on Visual Studio in parallel" 1)
 option(SLIC3R_MSVC_PDB          "Generate PDB files on MSVC in Release mode" 1)
 option(SLIC3R_ASAN              "Enable ASan on Clang and GCC" 0)
+option(ORCA_FAST_DEV            "Enable opt-in MSVC settings for faster local development builds" OFF)
+set(SLIC3R_MSVC_COMPILE_JOBS "" CACHE STRING "Optional positive worker count for MSVC /MP (empty uses /MP)")
+if (NOT SLIC3R_MSVC_COMPILE_JOBS STREQUAL "" AND NOT SLIC3R_MSVC_COMPILE_JOBS MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "SLIC3R_MSVC_COMPILE_JOBS must be empty or a positive integer")
+endif ()
 
 # Python stubgen module
 option(ORCA_BUILD_PYTHON_STUBGEN_MODULE "Build importable Python module for pybind11-stubgen" ON)
@@ -347,14 +363,34 @@ if (MSVC)
     # MultiProcessorCompilation property. Ninja parallelises on its own, and
     # clang-cl warns "argument unused" if the flag reaches it.
     if (SLIC3R_MSVC_COMPILE_PARALLEL AND CMAKE_GENERATOR MATCHES "Visual Studio")
-           add_compile_options(/MP)
+        if (SLIC3R_MSVC_COMPILE_JOBS STREQUAL "")
+            add_compile_options(/MP)
+        else ()
+            add_compile_options(/MP${SLIC3R_MSVC_COMPILE_JOBS})
+        endif ()
     endif ()
     # /bigobj (Increase Number of Sections in .Obj file)
     # error C3859: virtual memory range for PCH exceeded; please recompile with a command line option of '-Zm90' or greater
     # Generate symbols at every build target, even for the release.
 	# -Zm520 fixes error C3859 but forces the compiler to pre-allocate that memory for every translation unit regardless
 	# combining /Zi with /FS frees up a significant amount of memory pressure across all parallel compile jobs and makes /MP faster overall.
-    add_compile_options(-bigobj /Zi /FS)
+    if (ORCA_FAST_DEV)
+        # /Z7 is selected through CMAKE_MSVC_DEBUG_INFORMATION_FORMAT above.
+        # Avoid compiler PDB contention from the normal /Zi /FS combination.
+        add_compile_options(-bigobj)
+        if (CMAKE_GENERATOR MATCHES "^Ninja")
+            # CMake's MSVC platform module adds /Fd and /FS to Ninja compile
+            # rules independently of project flags. Embedded debug information
+            # does not use a compiler PDB, so remove that rule fragment too.
+            foreach (_lang C CXX)
+                string(REPLACE " /Fd<TARGET_COMPILE_PDB> /FS" ""
+                    CMAKE_${_lang}_COMPILE_OBJECT "${CMAKE_${_lang}_COMPILE_OBJECT}")
+            endforeach ()
+            unset(_lang)
+        endif ()
+    else ()
+        add_compile_options(-bigobj /Zi /FS)
+    endif ()
     # Disable STL4007: Many result_type typedefs and all argument_type, first_argument_type, and second_argument_type typedefs are deprecated in C++17.
     #FIXME Remove this line after eigen library adapts to the new C++17 adaptor rules.
     add_compile_options(-D_SILENCE_CXX17_ADAPTOR_TYPEDEFS_DEPRECATION_WARNING)
@@ -368,8 +404,24 @@ if (MSVC)
     # Prevent linker restart when TBB (or other deps) built with /GL are linked
 	# Make your full (clean) build slower because it enables link-time code generation across all translation units.
 	# helps incremental builds by preventing the double-link restart from TBB
-    set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /LTCG")
+    if (NOT ORCA_FAST_DEV)
+        set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /LTCG")
+    endif ()
+endif ()
+
+if (ORCA_FAST_DEV AND CMAKE_GENERATOR MATCHES "^Ninja")
+    if (SLIC3R_MSVC_COMPILE_JOBS STREQUAL "")
+        set(_orca_fast_dev_compile_jobs 8)
+    else ()
+        set(_orca_fast_dev_compile_jobs ${SLIC3R_MSVC_COMPILE_JOBS})
+    endif ()
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS
+        orca_compile=${_orca_fast_dev_compile_jobs}
+        orca_link=1)
+    set(CMAKE_JOB_POOL_COMPILE orca_compile)
+    set(CMAKE_JOB_POOL_LINK orca_link)
+    unset(_orca_fast_dev_compile_jobs)
 endif ()
 
 if (${CMAKE_CXX_COMPILER_ID} STREQUAL "AppleClang" AND ${CMAKE_CXX_COMPILER_VERSION} VERSION_GREATER 15)

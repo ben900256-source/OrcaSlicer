@@ -903,6 +903,18 @@ if (SLIC3R_PCH AND NOT SLIC3R_SYNTAXONLY)
     add_precompiled_header(libslic3r_gui pchheader.hpp FORCEINCLUDE)
 endif ()
 
+if (MSVC AND ORCA_FAST_DEV)
+    # Embedded debug information pushes this large static archive past the
+    # COFF librarian's 4 GiB limit. Keep the /Zi fallback local to the GUI;
+    # keep the exception target-local so core code still uses /Z7.
+    set_property(TARGET libslic3r_gui PROPERTY MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
+    target_compile_options(libslic3r_gui PRIVATE /FS)
+    if (CMAKE_GENERATOR MATCHES "^Ninja")
+        target_compile_options(libslic3r_gui PRIVATE
+            "/Fd${CMAKE_CURRENT_BINARY_DIR}/libslic3r_gui_compile.pdb")
+    endif ()
+endif ()
+
 # We need to implement some hacks for wxWidgets and touch the underlying GTK
 # layer and sub-libraries. This forces us to use the include locations and
 # link these libraries.
