@@ -1189,6 +1189,7 @@ static std::vector<std::string> s_Preset_print_options{
     "tree_support_top_rate",
     "tree_support_branch_distance",
     "tree_support_tip_diameter",
+    "tree_support_round_tip",
     "tree_support_branch_diameter",
     "tree_support_branch_diameter_angle",
     "detect_narrow_internal_solid_infill",

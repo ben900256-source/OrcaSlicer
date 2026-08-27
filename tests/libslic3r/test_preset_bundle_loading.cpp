@@ -1,7 +1,10 @@
 #include <catch2/catch_all.hpp>
 
 #include <boost/filesystem.hpp>
+#include <array>
 #include <fstream>
+
+#include "nlohmann/json.hpp"
 
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -564,5 +567,147 @@ TEST_CASE("A printer specific filament supersedes the generic library filament w
     const PresetWithVendorProfile generic_lib(*generic, &library);
     CHECK_FALSE(is_compatible_with_printer(generic_lib, PresetWithVendorProfile(*printer_a, nullptr)));
     CHECK(is_compatible_with_printer(generic_lib, PresetWithVendorProfile(*printer_c, nullptr)));
+}
+
+TEST_CASE("Prusa XL miniature Pin profiles resolve to the mixed-nozzle tool", "[Preset][Bundle][MiniaturePin]")
+{
+    static constexpr const char *machine_name = "Prusa XL 5T T2 0.25 nozzle (others 0.4)";
+    static constexpr const char *filament_name = "Prusa Generic Miniature PLA @XL 5T";
+    static constexpr const char *ultra_name = "0.05mm Miniature Ultra Detail + Pin @Prusa XL 5T T2 0.25";
+    static constexpr const char *balanced_name = "0.06mm Miniature Balanced + Pin @Prusa XL 5T T2 0.25";
+
+    // Non-instantiated bases are deliberately not exposed as selectable Presets. Loading both
+    // leaves with their inherited values proves the registered base was parsed and resolved.
+    std::ifstream base_stream(std::string(PROFILES_DIR) + "/Prusa/process/process_common_fdm_miniature_pin.json");
+    REQUIRE(base_stream.good());
+    const nlohmann::json base_json = nlohmann::json::parse(base_stream);
+    CHECK(base_json.at("instantiation") == "false");
+    CHECK(base_json.at("inherits") == "fdm_process_common");
+
+    PresetBundle bundle;
+    bundle.set_is_validation_mode(true);
+    const size_t loaded = bundle.load_vendor_configs_from_json(
+        PROFILES_DIR, "Prusa", PresetBundle::LoadSystem,
+        ForwardCompatibilitySubstitutionRule::EnableSilent).second;
+    REQUIRE(loaded > 0);
+    CHECK(bundle.error_count() == 0);
+
+    const Preset *mixed = bundle.printers.find_preset(machine_name);
+    const Preset *all_025 = bundle.printers.find_preset("Prusa XL 5T 0.25 nozzle");
+    const Preset *all_04 = bundle.printers.find_preset("Prusa XL 5T 0.4 nozzle");
+    const Preset *filament = bundle.filaments.find_preset(filament_name);
+    const Preset *ultra = bundle.prints.find_preset(ultra_name);
+    const Preset *balanced = bundle.prints.find_preset(balanced_name);
+    REQUIRE(mixed != nullptr);
+    REQUIRE(all_025 != nullptr);
+    REQUIRE(all_04 != nullptr);
+    REQUIRE(filament != nullptr);
+    REQUIRE(ultra != nullptr);
+    REQUIRE(balanced != nullptr);
+
+    CHECK(mixed->setting_id == "pnHHbTdiPFG91PkJ");
+    CHECK(filament->setting_id == "gxDkVTWzwp2RGs1B");
+    CHECK(ultra->setting_id == "8i9GCbiC0svpT5XW");
+    CHECK(balanced->setting_id == "8UkqYcJwzi4txFkG");
+    CHECK(mixed->config.opt_string("default_print_profile") == balanced_name);
+    const ConfigOptionStrings *default_filament = mixed->config.option<ConfigOptionStrings>("default_filament_profile");
+    REQUIRE(default_filament != nullptr);
+    REQUIRE(default_filament->values.size() == 1);
+    CHECK(default_filament->values.front() == filament_name);
+    CHECK(mixed->config.opt_int("master_extruder_id") == 2);
+
+    const ConfigOptionFloats *nozzles = mixed->config.option<ConfigOptionFloats>("nozzle_diameter");
+    const ConfigOptionFloats *min_heights = mixed->config.option<ConfigOptionFloats>("min_layer_height");
+    const ConfigOptionFloats *max_heights = mixed->config.option<ConfigOptionFloats>("max_layer_height");
+    REQUIRE(nozzles != nullptr);
+    REQUIRE(min_heights != nullptr);
+    REQUIRE(max_heights != nullptr);
+    REQUIRE(nozzles->values.size() == 5);
+    REQUIRE(min_heights->values.size() == 5);
+    REQUIRE(max_heights->values.size() == 5);
+    const std::vector<double> expected_nozzles { 0.4, 0.25, 0.4, 0.4, 0.4 };
+    const std::vector<double> expected_min_heights { 0.07, 0.05, 0.07, 0.07, 0.07 };
+    const std::vector<double> expected_max_heights { 0.3, 0.15, 0.3, 0.3, 0.3 };
+    for (size_t tool = 0; tool < expected_nozzles.size(); ++tool) {
+        CAPTURE(tool);
+        CHECK_THAT(nozzles->values[tool], Catch::Matchers::WithinAbs(expected_nozzles[tool], 1e-9));
+        CHECK_THAT(min_heights->values[tool], Catch::Matchers::WithinAbs(expected_min_heights[tool], 1e-9));
+        CHECK_THAT(max_heights->values[tool], Catch::Matchers::WithinAbs(expected_max_heights[tool], 1e-9));
+    }
+
+    const ConfigOptionFloats *all_025_nozzles = all_025->config.option<ConfigOptionFloats>("nozzle_diameter");
+    const ConfigOptionFloats *all_04_nozzles = all_04->config.option<ConfigOptionFloats>("nozzle_diameter");
+    REQUIRE(all_025_nozzles != nullptr);
+    REQUIRE(all_04_nozzles != nullptr);
+    REQUIRE(all_025_nozzles->values.size() == 5);
+    REQUIRE(all_04_nozzles->values.size() == 5);
+    for (size_t tool = 0; tool < 5; ++tool) {
+        CAPTURE(tool);
+        CHECK_THAT(all_025_nozzles->values[tool], Catch::Matchers::WithinAbs(0.25, 1e-9));
+        CHECK_THAT(all_04_nozzles->values[tool], Catch::Matchers::WithinAbs(0.4, 1e-9));
+    }
+
+    const std::array<const Preset *, 2> miniature_profiles { ultra, balanced };
+    const std::array<const char *, 8> tool_routed_options {
+        "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+        "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
+        "support_filament", "support_interface_filament"
+    };
+    for (const Preset *profile : miniature_profiles) {
+        CAPTURE(profile->name);
+        CHECK(profile->config.option("wall_generator")->serialize() == "classic");
+        CHECK(profile->config.option("wall_sequence")->serialize() == "inner-outer-inner wall");
+        CHECK(profile->config.opt_int("wall_loops") == 3);
+        CHECK(profile->config.option("sparse_infill_density")->serialize() == "20%");
+        CHECK(profile->config.option("sparse_infill_pattern")->serialize() == "gyroid");
+        CHECK(profile->config.option("line_width")->serialize() == "100%");
+        CHECK(profile->config.option("initial_layer_line_width")->serialize() == "125%");
+        CHECK(profile->config.option("inner_wall_line_width")->serialize() == "120%");
+        CHECK(profile->config.option("outer_wall_line_width")->serialize() == "115%");
+        CHECK(profile->config.option("sparse_infill_line_width")->serialize() == "110%");
+        CHECK(profile->config.option("internal_solid_infill_line_width")->serialize() == "110%");
+        CHECK(profile->config.option("top_surface_line_width")->serialize() == "105%");
+        CHECK(profile->config.option("brim_type")->serialize() == "outer_only");
+        CHECK_THAT(profile->config.opt_float("brim_width"),
+                   Catch::Matchers::WithinAbs(6.0, 1e-9));
+        CHECK_THAT(profile->config.opt_float("brim_object_gap"),
+                   Catch::Matchers::WithinAbs(0.0, 1e-9));
+        CHECK(profile->config.option("support_type")->serialize() == "tree(auto)");
+        CHECK(profile->config.option("support_style")->serialize() == "organic");
+        CHECK_FALSE(profile->config.opt_bool("support_on_build_plate_only"));
+        CHECK(profile->config.opt_int("support_interface_top_layers") == 0);
+        CHECK(profile->config.opt_int("support_interface_bottom_layers") == 0);
+        CHECK(profile->config.opt_bool("tree_support_round_tip"));
+        CHECK_THAT(profile->config.opt_float("tree_support_angle_slow"),
+                   Catch::Matchers::WithinAbs(25.0, 1e-9));
+        CHECK_THAT(profile->config.opt_float("tree_support_branch_distance_organic"),
+                   Catch::Matchers::WithinAbs(3.0, 1e-9));
+        for (const char *key : tool_routed_options) {
+            CAPTURE(key);
+            CHECK(profile->config.opt_int(key) == 2);
+        }
+
+        const PresetWithVendorProfile profile_with_vendor = bundle.prints.get_preset_with_vendor_profile(*profile);
+        CHECK(is_compatible_with_printer(profile_with_vendor, bundle.printers.get_preset_with_vendor_profile(*mixed)));
+        CHECK_FALSE(is_compatible_with_printer(profile_with_vendor, bundle.printers.get_preset_with_vendor_profile(*all_025)));
+        CHECK_FALSE(is_compatible_with_printer(profile_with_vendor, bundle.printers.get_preset_with_vendor_profile(*all_04)));
+    }
+    CHECK_THAT(ultra->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.05, 1e-9));
+    CHECK_THAT(balanced->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.06, 1e-9));
+
+    const ConfigOptionFloats *volumetric_speed = filament->config.option<ConfigOptionFloats>("filament_max_volumetric_speed");
+    const ConfigOptionStrings *start_gcode = filament->config.option<ConfigOptionStrings>("filament_start_gcode");
+    REQUIRE(volumetric_speed != nullptr);
+    REQUIRE(start_gcode != nullptr);
+    REQUIRE(volumetric_speed->values.size() == 1);
+    REQUIRE(start_gcode->values.size() == 1);
+    CHECK_THAT(volumetric_speed->values.front(), Catch::Matchers::WithinAbs(3.0, 1e-9));
+    CHECK(start_gcode->values.front().find("nozzle_diameter[filament_extruder_id]==0.25}0.14") != std::string::npos);
+    CHECK(start_gcode->values.front().find("nozzle_diameter[filament_extruder_id]==0.25}0.12") != std::string::npos);
+    CHECK(start_gcode->values.front().find("nozzle_diameter[0]") == std::string::npos);
+    CHECK(is_compatible_with_printer(bundle.filaments.get_preset_with_vendor_profile(*filament),
+                                     bundle.printers.get_preset_with_vendor_profile(*mixed)));
+    CHECK_FALSE(is_compatible_with_printer(bundle.filaments.get_preset_with_vendor_profile(*filament),
+                                           bundle.printers.get_preset_with_vendor_profile(*all_04)));
 }
 

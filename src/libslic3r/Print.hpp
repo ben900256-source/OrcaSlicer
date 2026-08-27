@@ -64,6 +64,17 @@ enum SupportNecessaryType {
     LargeOverhang,
 };
 
+// A realized Organic support tip in PrintObject-local coordinates. XY and the
+// nominal radius use Clipper's scaled integer units; Z values use millimetres.
+struct SupportContact
+{
+    Point    position;
+    coordf_t support_tip_z;
+    coordf_t model_contact_z;
+    coord_t  nominal_radius;
+    size_t   object_layer_id;
+};
+
 namespace FillAdaptive {
     struct Octree;
     struct OctreeDeleter;
@@ -333,6 +344,7 @@ public:
     void                         configBrimWidth(double m)      {m_config.brim_width.value = m; }
     ConstLayerPtrsAdaptor        layers() const         { return ConstLayerPtrsAdaptor(&m_layers); }
     ConstSupportLayerPtrsAdaptor support_layers() const { return ConstSupportLayerPtrsAdaptor(&m_support_layers); }
+    const std::vector<SupportContact>& support_contacts() const { return m_support_contacts; }
     const Transform3d&           trafo() const          { return m_trafo; }
     // Trafo with the center_offset() applied after the transformation, to center the object in XY before slicing.
     Transform3d                  trafo_centered() const
@@ -482,6 +494,7 @@ public:
   private:
     // to be called from Print only.
     friend class Print;
+    friend class TreeSupport;
 
 	PrintObject(Print* print, ModelObject* model_object, const Transform3d& trafo, PrintInstances&& instances);
 	~PrintObject();
@@ -568,6 +581,9 @@ private:
     SlicingParameters                       m_slicing_params;
     LayerPtrs                               m_layers;
     SupportLayerPtrs                        m_support_layers;
+    // Realized, connected Organic branch endpoints. Kept separate from the
+    // transient tree graph so callers can inspect contacts after slicing.
+    std::vector<SupportContact>             m_support_contacts;
     // BBS
     std::shared_ptr<TreeSupportData>        m_tree_support_preview_cache;
 
@@ -929,6 +945,9 @@ public:
     // Exports G-code into a file name based on the path_template, returns the file path of the generated G-code file.
     // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
     std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Empty means the current print can truthfully export discrete support contacts.
+    std::string         validate_support_contact_export() const;
+    void                export_support_contacts(const std::string &path, size_t plate_number) const;
     //return 0 means successful
     int                 export_cached_data(const std::string& dir_path, bool with_space=false);
     int                 load_cached_data(const std::string& directory);

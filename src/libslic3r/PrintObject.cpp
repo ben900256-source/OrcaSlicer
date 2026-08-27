@@ -1118,6 +1118,7 @@ SupportLayer* PrintObject::get_support_layer_at_printz(coordf_t print_z, coordf_
 
 void PrintObject::clear_support_layers()
 {
+    m_support_contacts.clear();
     if (!m_shared_object) {
         for (SupportLayer* l : m_support_layers)
             delete l;
@@ -1328,6 +1329,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "tree_support_branch_distance"
             || opt_key == "tree_support_branch_distance_organic"
             || opt_key == "tree_support_tip_diameter"
+            || opt_key == "tree_support_round_tip"
             || opt_key == "tree_support_branch_diameter"
             || opt_key == "tree_support_branch_diameter_organic"
             || opt_key == "tree_support_branch_diameter_angle"

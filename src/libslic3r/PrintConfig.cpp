@@ -7093,6 +7093,14 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.8));
 
+    def = this->add("tree_support_round_tip", coBool);
+    def->label = L("Round branch tips");
+    def->category = L("Support");
+    def->tooltip = L("Replace the final two horizontal slices of an Organic support branch with circles centered on its planned path. "
+                     "This keeps small discrete contacts round while preserving the normal branch below them.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def           = this->add("tree_support_branch_diameter", coFloat);
     def->label    = L("Tree support branch diameter");
     def->category = L("Support");
@@ -11801,6 +11809,13 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->tooltip = L("Export slicing data to a folder");
     def->cli_params = "slicing_data_directory";
     def->set_default_value(new ConfigOptionString("cached_data"));
+
+    def = this->add("export_support_contacts", coString);
+    def->label = L("Export support contacts");
+    def->tooltip = L("Export realized discrete Organic support contacts to a folder.");
+    def->cli = "export-support-contacts";
+    def->cli_params = "directory";
+    def->set_default_value(new ConfigOptionString("."));
 
     def = this->add("load_slicedata", coStrings);
     def->label = L("Load slicing data");

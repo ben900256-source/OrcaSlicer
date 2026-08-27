@@ -1,6 +1,6 @@
 {
 	"name": "Prusa",
-	"version": "02.04.00.03",
+	"version": "02.04.00.07",
 	"force_update": "0",
 	"description": "Prusa configurations",
 	"machine_model_list": [
@@ -61,6 +61,10 @@
 		{
 			"name": "fdm_process_common",
 			"sub_path": "process/fdm_process_common.json"
+		},
+		{
+			"name": "process_common_fdm_miniature_pin",
+			"sub_path": "process/process_common_fdm_miniature_pin.json"
 		},
 		{
 			"name": "process_common_mk3",
@@ -981,6 +985,14 @@
 		{
 			"name": "0.05mm Detail @Prusa XL 5T 0.25",
 			"sub_path": "process/0.05mm Detail @Prusa XL 5T 0.25.json"
+		},
+		{
+			"name": "0.05mm Miniature Ultra Detail + Pin @Prusa XL 5T T2 0.25",
+			"sub_path": "process/0.05mm Miniature Ultra Detail + Pin @Prusa XL 5T T2 0.25.json"
+		},
+		{
+			"name": "0.06mm Miniature Balanced + Pin @Prusa XL 5T T2 0.25",
+			"sub_path": "process/0.06mm Miniature Balanced + Pin @Prusa XL 5T T2 0.25.json"
 		},
 		{
 			"name": "0.07mm Detail @Prusa XL 5T 0.25",
@@ -1941,6 +1953,10 @@
 			"sub_path": "filament/Prusa Generic PLA @XL 5T.json"
 		},
 		{
+			"name": "Prusa Generic Miniature PLA @XL 5T",
+			"sub_path": "filament/Prusa Generic Miniature PLA @XL 5T.json"
+		},
+		{
 			"name": "Prusa Generic PLA HF @MINIIS",
 			"sub_path": "filament/Prusa Generic PLA HF @MINIIS.json"
 		},
@@ -2709,6 +2725,10 @@
 		{
 			"name": "Prusa XL 5T 0.25 nozzle",
 			"sub_path": "machine/Prusa XL 5T 0.25 nozzle.json"
+		},
+		{
+			"name": "Prusa XL 5T T2 0.25 nozzle (others 0.4)",
+			"sub_path": "machine/Prusa XL 5T T2 0.25 nozzle (others 0.4).json"
 		},
 		{
 			"name": "Prusa XL 5T 0.3 nozzle",

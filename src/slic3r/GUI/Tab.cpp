@@ -2956,6 +2956,7 @@ void TabPrint::build()
 
         optgroup = page->new_optgroup(L("Tree supports"), L"param_support_tree");
         optgroup->append_single_option_line("tree_support_tip_diameter", "support_settings_tree#tip-diameter");
+        optgroup->append_single_option_line("tree_support_round_tip", "support_settings_tree#tip-diameter");
         optgroup->append_single_option_line("tree_support_branch_distance", "support_settings_tree#branch-distance");
         optgroup->append_single_option_line("tree_support_branch_distance_organic", "support_settings_tree#branch-distance");
         optgroup->append_single_option_line("tree_support_top_rate", "support_settings_tree#branch-density");
