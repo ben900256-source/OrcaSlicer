@@ -21,7 +21,7 @@ The source profile was made for different hardware. This fork reuses its geometr
 | Walls and infill | Classic walls, inner/outer/inner order, 3 walls, 20% gyroid | Ironing remains off |
 | Line widths | Default 100%, first layer 125%, inner 120%, outer 115%, infill/solid 110%, top 105% | Percentages resolve against tool 2's 0.25 mm nozzle |
 | Speeds | Outer/top 35, inner 55, solid 45, sparse 65, gap 30, support 45, travel 325 mm/s | XL process acceleration values are retained instead of the source machine's limits |
-| Adhesion and precision | 2-loop skirt, 6 mm outer brim, reduced wall crossing, curled-perimeter slowdown, 0.001 mm slicing resolution | Applied through a hidden cross-printer base |
+| Adhesion and precision | 2-loop skirt, 6 mm outer brim, reduced wall crossing, curled-perimeter slowdown, 0.001 mm slicing resolution | The brim uses zero object gap so it remains coupled to the miniature and support bases; applied through a hidden cross-printer base |
 | Supports | Automatic Organic supports | Supports are allowed everywhere, including model-supported islands |
 | Pin contact | Community interface geometry replaced | No interface layers; opt-in round final two tip slices; 0.4 mm support width/tip, 2 mm branches, 5 degree diameter angle, 3 mm branch distance, 13.33% density |
 | Layer variants | 0.06 mm source baseline | Experimental one-layer contact clearance: 0.06 mm for Balanced and 0.05 mm for Ultra Detail |

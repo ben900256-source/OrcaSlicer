@@ -667,6 +667,11 @@ TEST_CASE("Prusa XL miniature Pin profiles resolve to the mixed-nozzle tool", "[
         CHECK(profile->config.option("sparse_infill_line_width")->serialize() == "110%");
         CHECK(profile->config.option("internal_solid_infill_line_width")->serialize() == "110%");
         CHECK(profile->config.option("top_surface_line_width")->serialize() == "105%");
+        CHECK(profile->config.option("brim_type")->serialize() == "outer_only");
+        CHECK_THAT(profile->config.opt_float("brim_width"),
+                   Catch::Matchers::WithinAbs(6.0, 1e-9));
+        CHECK_THAT(profile->config.opt_float("brim_object_gap"),
+                   Catch::Matchers::WithinAbs(0.0, 1e-9));
         CHECK(profile->config.option("support_type")->serialize() == "tree(auto)");
         CHECK(profile->config.option("support_style")->serialize() == "organic");
         CHECK_FALSE(profile->config.opt_bool("support_on_build_plate_only"));
