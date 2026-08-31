@@ -708,6 +708,7 @@ void TreeSupport::store_organic_support_contacts(
                                rhs.model_contact_z, rhs.nominal_radius);
     });
     m_object->m_support_contacts = std::move(contacts);
+    m_object->m_support_associations.clear();
 }
 
 

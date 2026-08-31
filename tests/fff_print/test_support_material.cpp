@@ -49,6 +49,7 @@ DynamicPrintConfig organic_contact_config(double spacing = 2., double density = 
 }
 
 using ContactSignature = std::tuple<coord_t, coord_t, coordf_t, coordf_t, coord_t, size_t>;
+using AssociationSignature = std::tuple<size_t, std::string, int, double, double, std::optional<double>, std::optional<double>>;
 
 std::vector<ContactSignature> contact_signatures(const PrintObject &object)
 {
@@ -58,6 +59,144 @@ std::vector<ContactSignature> contact_signatures(const PrintObject &object)
         out.emplace_back(contact.position.x(), contact.position.y(), contact.support_tip_z,
                          contact.model_contact_z, contact.nominal_radius, contact.object_layer_id);
     return out;
+}
+
+std::vector<AssociationSignature> association_signatures(const std::vector<OrganicSupport::Contact> &contacts)
+{
+    std::vector<AssociationSignature> out;
+    for (const OrganicSupport::Contact &contact : contacts)
+        for (const OrganicSupport::ExtrusionAssociation &association : contact.associations)
+            out.emplace_back(contact.contact_id, association.extrusion_id.to_string(), int(association.role),
+                             association.width, association.centerline_distance,
+                             association.path_arclength_interval ?
+                                 std::optional<double>(association.path_arclength_interval->begin) : std::nullopt,
+                             association.path_arclength_interval ?
+                                 std::optional<double>(association.path_arclength_interval->end) : std::nullopt);
+    return out;
+}
+
+std::vector<AssociationSignature> association_signatures(const PrintObject &object)
+{
+    return association_signatures(object.support_associations());
+}
+
+void append_path_snapshot(const ExtrusionEntity &entity, nlohmann::json &paths)
+{
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            append_path_snapshot(*child, paths);
+        return;
+    }
+    auto append = [&paths](const ExtrusionPath &path) {
+        nlohmann::json points = nlohmann::json::array();
+        for (const Point3 &point : path.polyline.points)
+            points.push_back({ point.x(), point.y(), point.z() });
+        nlohmann::json fittings = nlohmann::json::array();
+        for (const PathFittingData &fitting : path.polyline.fitting_result)
+            fittings.push_back({
+                { "start", fitting.start_point_index },
+                { "end", fitting.end_point_index },
+                { "type", int(fitting.path_type) },
+                { "center", { fitting.arc_data.center.x(), fitting.arc_data.center.y() } },
+                { "radius", fitting.arc_data.radius },
+                { "angle", fitting.arc_data.angle_radians }
+            });
+        paths.push_back({
+            { "role", int(path.role()) }, { "width", path.width }, { "height", path.height },
+            { "mm3_per_mm", path.mm3_per_mm }, { "no_extrusion", path.is_force_no_extrusion() },
+            { "points", std::move(points) }, { "fittings", std::move(fittings) }
+        });
+    };
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        append(*path);
+    else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        for (const ExtrusionPath &path : loop->paths) append(path);
+    else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        for (const ExtrusionPath &path : multipath->paths) append(path);
+}
+
+std::string final_model_path_snapshot(const PrintObject &object)
+{
+    nlohmann::json paths = nlohmann::json::array();
+    for (const Layer *layer : object.layers())
+        for (const LayerRegion *region : layer->regions()) {
+            append_path_snapshot(region->perimeters, paths);
+            append_path_snapshot(region->fills, paths);
+        }
+    return paths.dump();
+}
+
+const ExtrusionPath *resolve_association_path(const PrintObject &object,
+                                              const OrganicSupport::ExtrusionId &id)
+{
+    const Layer *layer = nullptr;
+    for (const Layer *candidate : object.layers())
+        if (candidate->id() == id.layer_id) {
+            layer = candidate;
+            break;
+        }
+    if (layer == nullptr || id.region_id >= layer->region_count())
+        return nullptr;
+    const LayerRegion *region = layer->get_region(int(id.region_id));
+    const ExtrusionEntity *entity = id.source == OrganicSupport::ExtrusionSource::Perimeter ?
+        static_cast<const ExtrusionEntity *>(&region->perimeters) :
+        static_cast<const ExtrusionEntity *>(&region->fills);
+    for (size_t entity_idx : id.entity_indices) {
+        const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity);
+        if (collection == nullptr || entity_idx >= collection->entities.size())
+            return nullptr;
+        entity = collection->entities[entity_idx];
+    }
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity))
+        return id.leaf_path_index == 0 ? path : nullptr;
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity))
+        return id.leaf_path_index < loop->paths.size() ? &loop->paths[id.leaf_path_index] : nullptr;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(entity))
+        return id.leaf_path_index < multipath->paths.size() ? &multipath->paths[id.leaf_path_index] : nullptr;
+    return nullptr;
+}
+
+void check_gui_association_intervals_resolve(const PrintObject &object)
+{
+    const std::vector<OrganicSupport::PathChain> chains =
+        OrganicSupport::extract_finalized_path_chains(object);
+    auto find_chain = [&chains](const OrganicSupport::ExtrusionId &id) {
+        return std::find_if(chains.begin(), chains.end(), [&id](const OrganicSupport::PathChain &chain) {
+            return std::any_of(chain.leaves.begin(), chain.leaves.end(), [&id](const OrganicSupport::PathLeaf &leaf) {
+                return leaf.id == id;
+            });
+        });
+    };
+
+    for (const OrganicSupport::Contact &contact : object.support_associations())
+        for (const OrganicSupport::ExtrusionAssociation &association : contact.associations) {
+            const auto chain_it = find_chain(association.extrusion_id);
+            REQUIRE(chain_it != chains.end());
+            if (!association.path_arclength_interval) {
+                CHECK_FALSE(association.planned_material_unsupported_span.has_value());
+                continue;
+            }
+
+            CHECK_FALSE(OrganicSupport::clip_path_chain_interval(
+                *chain_it, *association.path_arclength_interval).empty());
+            if (!association.planned_material_unsupported_span)
+                continue;
+
+            const OrganicSupport::PathInterval &nominal = *association.path_arclength_interval;
+            const auto check_direction = [&](const OrganicSupport::DirectionalUnsupportedSpan &direction,
+                                             bool forward) {
+                const std::optional<double> distance = direction.span ? direction.span : direction.unanchored_distance;
+                REQUIRE(distance.has_value());
+                const OrganicSupport::PathInterval span_interval = forward ?
+                    OrganicSupport::PathInterval{ nominal.end, nominal.end + *distance } :
+                    OrganicSupport::PathInterval{ nominal.begin - *distance, nominal.begin };
+                CHECK_FALSE(OrganicSupport::clip_path_chain_interval(*chain_it, span_interval).empty());
+                for (const OrganicSupport::PlannedMaterialAnchor &anchor : direction.anchors)
+                    CHECK_FALSE(OrganicSupport::clip_path_chain_interval(*chain_it, anchor.interval).empty());
+            };
+            check_direction(association.planned_material_unsupported_span->forward, true);
+            check_direction(association.planned_material_unsupported_span->backward, false);
+        }
 }
 
 double median_nearest_neighbour_distance(const std::vector<SupportContact> &contacts)
@@ -313,6 +452,7 @@ TEST_CASE("Organic supports expose deterministic realized contacts", "[SupportMa
     const PrintObject &first_object = *first.objects().front();
     const auto first_contacts = contact_signatures(first_object);
     REQUIRE_FALSE(first_contacts.empty());
+    CHECK(first_object.support_associations().empty());
     CHECK(std::is_sorted(first_contacts.begin(), first_contacts.end()));
     for (const SupportContact &contact : first_object.support_contacts()) {
         CHECK(contact.nominal_radius == scaled<coord_t>(0.2));
@@ -347,9 +487,11 @@ TEST_CASE("Organic supports expose deterministic realized contacts", "[SupportMa
 
 TEST_CASE("Organic contact snapshots exclude unrealized branch endpoints", "[SupportMaterial][OrganicContacts]")
 {
+    DynamicPrintConfig config = organic_contact_config();
+    config.set_deserialize_strict({ { "tree_support_round_tip", true } });
     Print print;
     Model model;
-    init_print({ TestMesh::overhang }, print, model, organic_contact_config());
+    init_print({ TestMesh::overhang }, print, model, config);
     print.process();
 
     PrintObject &object = *print.get_object(0);
@@ -390,11 +532,16 @@ TEST_CASE("Organic contact snapshots exclude unrealized branch endpoints", "[Sup
 
     REQUIRE(object.support_contacts().size() == 1);
     CHECK(object.support_contacts().front().position == endpoint.target_position);
+    CHECK(object.support_associations().empty());
+    const std::vector<OrganicSupport::Contact> rebuilt = OrganicSupport::build(object);
+    REQUIRE(rebuilt.size() == 1);
+    CHECK(rebuilt.front().contact_id == 0);
 }
 
 TEST_CASE("Organic contacts survive invalidation and slicedata cache round trips", "[SupportMaterial][OrganicContacts]")
 {
     DynamicPrintConfig config = organic_contact_config();
+    config.set_deserialize_strict({ { "tree_support_round_tip", true } });
     Print              print;
     Model              model;
     init_print({ TestMesh::overhang }, print, model, config);
@@ -402,12 +549,15 @@ TEST_CASE("Organic contacts survive invalidation and slicedata cache round trips
 
     PrintObject &object = *print.get_object(0);
     const auto expected = contact_signatures(object);
+    const auto expected_associations = association_signatures(object);
     REQUIRE_FALSE(expected.empty());
+    REQUIRE_FALSE(expected_associations.empty());
 
     config.set_deserialize_strict({ { "support_threshold_angle", 31 } });
     print.apply(model, config);
     CHECK_FALSE(object.is_step_done(posSupportMaterial));
     CHECK(contact_signatures(object) == expected);
+    CHECK(object.support_associations().empty());
 
     ScopedTemporaryDir temporary("support-contact-cache");
     const boost::filesystem::path cache = temporary.path() / "slicedata";
@@ -424,11 +574,14 @@ TEST_CASE("Organic contacts survive invalidation and slicedata cache round trips
 
     REQUIRE(print.load_cached_data(cache.string()) == 0);
     CHECK(contact_signatures(object) == expected);
+    CHECK(association_signatures(object) == expected_associations);
+    check_gui_association_intervals_resolve(object);
 }
 
 TEST_CASE("Support contact reports apply instance transforms and summarize nominal area", "[SupportMaterial][OrganicContacts]")
 {
-    const DynamicPrintConfig config = organic_contact_config();
+    DynamicPrintConfig config = organic_contact_config();
+    config.set_deserialize_strict({ { "tree_support_round_tip", true } });
     Print print;
     Model model;
     init_print({ TestMesh::overhang }, print, model, config);
@@ -441,13 +594,14 @@ TEST_CASE("Support contact reports apply instance transforms and summarize nomin
 
     const size_t contacts_per_instance = print.objects().front()->support_contacts().size();
     REQUIRE(contacts_per_instance > 0);
+    check_gui_association_intervals_resolve(*print.objects().front());
 
     ScopedTemporaryFile report_file(".support-contacts.json");
     print.export_support_contacts(report_file.string(), 3);
     std::ifstream report_stream(report_file.string());
     const nlohmann::json report = nlohmann::json::parse(report_stream);
 
-    CHECK(report.at("schema_version") == 1);
+    CHECK(report.at("schema_version") == 2);
     CHECK(report.at("plate") == 3);
     CHECK(report.at("coordinate_space") == "plate-local");
     CHECK(report.at("units").at("position") == "mm");
@@ -463,14 +617,140 @@ TEST_CASE("Support contact reports apply instance transforms and summarize nomin
     CHECK(first_contact.contains("model_contact_z"));
     CHECK(first_contact.contains("nominal_radius"));
     CHECK(first_contact.contains("object_layer_id"));
+    CHECK(first_contact.contains("contact_id"));
+    CHECK(first_contact.contains("supported_layer"));
+    CHECK(first_contact.contains("nominal_clearance"));
+    CHECK(first_contact.contains("association_status"));
+    CHECK(first_contact.contains("associations"));
     CHECK_THAT(second_contact.at("x").get<double>() - first_contact.at("x").get<double>(),
                Catch::Matchers::WithinAbs(40., 1e-9));
     CHECK_THAT(second_contact.at("y").get<double>(),
                Catch::Matchers::WithinAbs(first_contact.at("y").get<double>(), 1e-9));
 
+    size_t associated_contact = 0;
+    while (associated_contact < contacts_per_instance &&
+           report.at("instances").at(0).at("contacts").at(associated_contact).at("associations").empty())
+        ++associated_contact;
+    REQUIRE(associated_contact < contacts_per_instance);
+    const auto &first_association = report.at("instances").at(0).at("contacts").at(associated_contact)
+        .at("associations").at(0);
+    CHECK(first_association.at("extrusion_id").contains("layer_id"));
+    CHECK(first_association.at("extrusion_id").contains("region_id"));
+    CHECK(first_association.at("extrusion_id").contains("entity_indices"));
+    CHECK(first_association.contains("extrusion_id_string"));
+    CHECK(first_association.at("role") != "unsupported");
+    CHECK(first_association.contains("width"));
+    CHECK(first_association.contains("centerline_distance"));
+    CHECK(first_association.contains("nominal_overlap_length"));
+    CHECK(first_association.contains("path_arclength_interval"));
+    CHECK(first_association.at("tangent").contains("ambiguous"));
+    CHECK(first_association.contains("approximately_centered"));
+    CHECK(first_association.contains("planned_material_unsupported_span"));
+
+    const auto &first_closest = first_association.at("closest_point");
+    const auto &second_closest = report.at("instances").at(1).at("contacts").at(associated_contact)
+        .at("associations").at(0).at("closest_point");
+    CHECK_THAT(second_closest.at("x").get<double>() - first_closest.at("x").get<double>(),
+               Catch::Matchers::WithinAbs(40., 1e-9));
+    CHECK_THAT(second_closest.at("y").get<double>(),
+               Catch::Matchers::WithinAbs(first_closest.at("y").get<double>(), 1e-9));
+
     const double expected_area = 2. * contacts_per_instance * PI * 0.2 * 0.2;
     CHECK_THAT(report.at("total_nominal_circular_area").get<double>(),
                Catch::Matchers::WithinAbs(expected_area, 1e-9));
+}
+
+TEST_CASE("Round Organic contacts resolve finalized model extrusion paths", "[SupportMaterial][OrganicContacts]")
+{
+    DynamicPrintConfig config = organic_contact_config(3., 13.33);
+    config.set_deserialize_strict({
+        { "tree_support_round_tip", true },
+        { "layer_height", 0.1 },
+        { "initial_layer_print_height", 0.1 }
+    });
+    TriangleMesh coupon = load_model("support_contact_coupon.obj");
+    coupon.scale(Vec3f(1.f, 1.f, 0.25f));
+    Print print;
+    Model model;
+    init_print({ std::move(coupon) }, print, model, config);
+    print.process();
+
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_associations().size() == object.support_contacts().size());
+    size_t association_count = 0;
+    for (size_t contact_id = 0; contact_id < object.support_associations().size(); ++contact_id) {
+        const OrganicSupport::Contact &contact = object.support_associations()[contact_id];
+        CHECK(contact.contact_id == contact_id);
+        CHECK(contact.supported_layer_id == object.support_contacts()[contact_id].object_layer_id);
+        CHECK_THAT(contact.association_tolerance,
+                   Catch::Matchers::WithinAbs(std::max(EPSILON, print.config().resolution.value), 1e-12));
+        for (const OrganicSupport::ExtrusionAssociation &association : contact.associations) {
+            ++association_count;
+            const ExtrusionPath *path = resolve_association_path(object, association.extrusion_id);
+            REQUIRE(path != nullptr);
+            CHECK(path->role() == association.role);
+            CHECK_THAT(path->width, Catch::Matchers::WithinAbs(association.width, 1e-9));
+            CHECK(association.extrusion_id.layer_id == contact.supported_layer_id);
+        }
+    }
+    REQUIRE(association_count > 0);
+    check_gui_association_intervals_resolve(object);
+
+    const std::string paths_before = final_model_path_snapshot(object);
+    const std::vector<OrganicSupport::Contact> rebuilt = OrganicSupport::build(object);
+    CHECK(final_model_path_snapshot(object) == paths_before);
+    CHECK(association_signatures(rebuilt) == association_signatures(object));
+    const std::vector<OrganicSupport::Contact> rebuilt_again = OrganicSupport::build(object);
+    CHECK(association_signatures(rebuilt_again) == association_signatures(rebuilt));
+
+    const std::string gcode_before = gcode(print);
+    ScopedTemporaryFile report_file(".support-contacts.json");
+    print.export_support_contacts(report_file.string(), 0);
+    std::ifstream first_report_stream(report_file.string());
+    std::ostringstream first_report;
+    first_report << first_report_stream.rdbuf();
+    ScopedTemporaryFile second_report_file(".support-contacts.json");
+    print.export_support_contacts(second_report_file.string(), 0);
+    std::ifstream second_report_stream(second_report_file.string());
+    std::ostringstream second_report;
+    second_report << second_report_stream.rdbuf();
+    CHECK(second_report.str() == first_report.str());
+
+    auto without_generated_timestamp = [](std::string value) {
+        const size_t begin = value.find("; generated by OrcaSlicer ");
+        if (begin != std::string::npos) {
+            const size_t end = value.find('\n', begin);
+            value.erase(begin, end == std::string::npos ? value.size() - begin : end - begin + 1);
+        }
+        return value;
+    };
+    CHECK(without_generated_timestamp(gcode(print)) == without_generated_timestamp(gcode_before));
+}
+
+TEST_CASE("Shared Organic objects rebuild identical associations", "[SupportMaterial][OrganicContacts]")
+{
+    DynamicPrintConfig config = organic_contact_config();
+    config.set_deserialize_strict({ { "tree_support_round_tip", true } });
+    Print print;
+    Model model;
+    init_print({ TestMesh::overhang }, print, model, config);
+    ModelObject *original = model.objects.front();
+    if (!original->config.has("extruder"))
+        original->config.set_key_value("extruder", new ConfigOptionInt(1));
+    ModelObject *duplicate = model.add_object(*original);
+    for (ModelInstance *instance : duplicate->instances)
+        instance->set_offset(instance->get_offset() + Vec3d(40., 0., 0.));
+    print.apply(model, config);
+    print.process();
+
+    REQUIRE(print.objects().size() == 2);
+    const PrintObject &first = *print.objects()[0];
+    const PrintObject &second = *print.objects()[1];
+    REQUIRE_FALSE(first.support_associations().empty());
+    CHECK(association_signatures(second) == association_signatures(first));
+    CHECK(second.get_shared_object() == &first);
+    check_gui_association_intervals_resolve(first);
+    check_gui_association_intervals_resolve(second);
 }
 
 TEST_CASE("Support contact export rejects non-discrete support configurations", "[SupportMaterial][OrganicContacts]")
@@ -700,7 +980,7 @@ TEST_CASE("Prusa XL miniature profiles realize one-layer Pin contacts on physica
             print.export_support_contacts(report_file.string(), 0);
             std::ifstream report_stream(report_file.string());
             const nlohmann::json report = nlohmann::json::parse(report_stream);
-            CHECK(report.at("schema_version") == 1);
+            CHECK(report.at("schema_version") == 2);
             CHECK(report.at("contact_count") == object.support_contacts().size());
 
             ScopedTemporaryFile repeated_report_file(".support-contacts.json");

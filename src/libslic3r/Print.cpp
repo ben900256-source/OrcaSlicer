@@ -2136,6 +2136,7 @@ void Print::auto_assign_extruders(ModelObject* model_object) const
 void  PrintObject::set_shared_object(PrintObject *object)
 {
     m_shared_object = object;
+    m_support_associations.clear();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": this=%1%, found shared object from %2%")%this%m_shared_object;
 }
 
@@ -2146,6 +2147,7 @@ void  PrintObject::clear_shared_object()
         m_layers.clear();
         m_support_layers.clear();
         m_support_contacts.clear();
+        m_support_associations.clear();
 
         m_shared_object = nullptr;
 
@@ -2158,6 +2160,7 @@ void  PrintObject::copy_layers_from_shared_object()
     if (m_shared_object) {
         m_layers.clear();
         m_support_layers.clear();
+        m_support_associations.clear();
 
         firstLayerObjSliceByVolume.clear();
         firstLayerObjSliceByGroups.clear();
@@ -2790,6 +2793,12 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                 obj->set_done(posSimplifySupportPath);
         }
     }
+
+    // Contacts and model paths are both final here for freshly sliced,
+    // cache-loaded and shared objects. The derived diagnostics intentionally
+    // run before conflict checking and never modify the inspected entities.
+    for (PrintObject *obj : m_objects)
+        obj->rebuild_support_associations();
 
     // BBS
     bool has_adaptive_layer_height = false;
@@ -5382,23 +5391,121 @@ void Print::export_support_contacts(const std::string &path, size_t plate_number
     size_t contact_count = 0;
     double total_nominal_area = 0.;
 
+    auto extrusion_id_json = [](const OrganicSupport::ExtrusionId &id) {
+        return json{
+            { "layer_id", id.layer_id },
+            { "region_id", id.region_id },
+            { "source", OrganicSupport::extrusion_source_name(id.source) },
+            { "entity_indices", id.entity_indices },
+            { "leaf_path_index", id.leaf_path_index }
+        };
+    };
+    auto interval_json = [](const OrganicSupport::PathInterval &interval) {
+        return json{ { "begin", interval.begin }, { "end", interval.end } };
+    };
+    auto anchor_json = [&](const OrganicSupport::PlannedMaterialAnchor &anchor) {
+        json value = {
+            { "type", OrganicSupport::anchor_type_name(anchor.type) },
+            { "path_arclength_interval", interval_json(anchor.interval) }
+        };
+        if (anchor.type == OrganicSupport::AnchorType::Pin)
+            value["contact_id"] = anchor.contact_id;
+        if (anchor.extrusion_id) {
+            value["extrusion_id"] = extrusion_id_json(*anchor.extrusion_id);
+            value["extrusion_id_string"] = anchor.extrusion_id->to_string();
+        }
+        return value;
+    };
+    auto direction_json = [&](const OrganicSupport::DirectionalUnsupportedSpan &direction) {
+        json anchors = json::array();
+        for (const OrganicSupport::PlannedMaterialAnchor &anchor : direction.anchors)
+            anchors.push_back(anchor_json(anchor));
+        return json{
+            { "span", direction.span ? json(*direction.span) : json(nullptr) },
+            { "unanchored_distance", direction.unanchored_distance ? json(*direction.unanchored_distance) : json(nullptr) },
+            { "anchors", std::move(anchors) }
+        };
+    };
+
     for (const PrintObject *object : m_objects) {
         const auto &contacts = object->support_contacts();
+        const auto &association_contacts = object->support_associations();
         for (const PrintInstance &instance : object->instances()) {
             json contacts_json = json::array();
             const Point shift = instance.shift_without_plate_offset();
+            const Vec2d shift_mm(unscale<double>(shift.x()), unscale<double>(shift.y()));
             double instance_nominal_area = 0.;
 
-            for (const SupportContact &contact : contacts) {
+            for (size_t contact_id = 0; contact_id < contacts.size(); ++contact_id) {
+                const SupportContact &contact = contacts[contact_id];
                 const Point plate_position = contact.position + shift;
                 const double radius = unscale<double>(contact.nominal_radius);
+                const OrganicSupport::Contact *association_contact =
+                    contact_id < association_contacts.size() && association_contacts[contact_id].contact_id == contact_id ?
+                    &association_contacts[contact_id] : nullptr;
+                const Layer *supported_layer = nullptr;
+                for (const Layer *layer : object->layers())
+                    if (layer->id() == contact.object_layer_id) {
+                        supported_layer = layer;
+                        break;
+                    }
+                const double tolerance = association_contact == nullptr ?
+                    std::max(EPSILON, this->config().resolution.value) : association_contact->association_tolerance;
+
+                json associations_json = json::array();
+                if (association_contact != nullptr) {
+                    for (const OrganicSupport::ExtrusionAssociation &association : association_contact->associations) {
+                        json planned_span = nullptr;
+                        if (association.planned_material_unsupported_span) {
+                            planned_span = {
+                                { "forward", direction_json(association.planned_material_unsupported_span->forward) },
+                                { "backward", direction_json(association.planned_material_unsupported_span->backward) }
+                            };
+                        }
+                        associations_json.push_back({
+                            { "extrusion_id", extrusion_id_json(association.extrusion_id) },
+                            { "extrusion_id_string", association.extrusion_id.to_string() },
+                            { "role", OrganicSupport::extrusion_role_name(association.role) },
+                            { "source", OrganicSupport::extrusion_source_name(association.extrusion_id.source) },
+                            { "width", association.width },
+                            { "closest_point", {
+                                { "x", association.closest_point.x() + shift_mm.x() },
+                                { "y", association.closest_point.y() + shift_mm.y() }
+                            } },
+                            { "centerline_distance", association.centerline_distance },
+                            { "nominal_overlap_length", association.nominal_overlap_length },
+                            { "path_arclength_interval", association.path_arclength_interval ?
+                                interval_json(*association.path_arclength_interval) : json(nullptr) },
+                            { "tangent", {
+                                { "x", association.tangent.x() },
+                                { "y", association.tangent.y() },
+                                { "ambiguous", association.tangent_ambiguous }
+                            } },
+                            { "approximately_centered", association.approximately_centered },
+                            { "planned_material_unsupported_span", std::move(planned_span) }
+                        });
+                    }
+                }
+
+                const char *association_status = !object->config().tree_support_round_tip.value ? "disabled" :
+                    (associations_json.empty() ? "unassociated" : "associated");
                 contacts_json.push_back({
+                    { "contact_id", contact_id },
                     { "x", unscale<double>(plate_position.x()) },
                     { "y", unscale<double>(plate_position.y()) },
                     { "support_tip_z", contact.support_tip_z },
                     { "model_contact_z", contact.model_contact_z },
                     { "nominal_radius", radius },
-                    { "object_layer_id", contact.object_layer_id }
+                    { "object_layer_id", contact.object_layer_id },
+                    { "supported_layer", {
+                        { "id", contact.object_layer_id },
+                        { "print_z", supported_layer == nullptr ? json(nullptr) : json(supported_layer->print_z) },
+                        { "bottom_z", contact.model_contact_z }
+                    } },
+                    { "nominal_clearance", contact.model_contact_z - contact.support_tip_z },
+                    { "association_tolerance", tolerance },
+                    { "association_status", association_status },
+                    { "associations", std::move(associations_json) }
                 });
                 instance_nominal_area += PI * radius * radius;
             }
@@ -5417,13 +5524,16 @@ void Print::export_support_contacts(const std::string &path, size_t plate_number
     }
 
     json root_json = {
-        { "schema_version", 1 },
+        { "schema_version", 2 },
         { "plate", plate_number },
         { "coordinate_space", "plate-local" },
         { "units", {
             { "position", "mm" },
             { "z", "mm" },
             { "radius", "mm" },
+            { "width", "mm" },
+            { "distance", "mm" },
+            { "path_arclength", "mm" },
             { "area", "mm^2" }
         } },
         { "contact_count", contact_count },
@@ -5907,6 +6017,7 @@ int Print::load_cached_data(const std::string& directory)
             // This field is optional so slicedata produced by older versions
             // remains loadable. New caches retain exact scaled XY/radius data.
             obj->m_support_contacts.clear();
+            obj->m_support_associations.clear();
             if (root_json.contains(JSON_SUPPORT_CONTACTS)) {
                 for (const json &contact_json : root_json[JSON_SUPPORT_CONTACTS]) {
                     obj->m_support_contacts.push_back({
@@ -5944,6 +6055,11 @@ int Print::load_cached_data(const std::string& directory)
                 }
                 firstlayer_objgroups.push_back(std::move(firstlayer_group));
             }
+
+            // Cached paths are already in their final simplified form. Rebuild
+            // the derived diagnostics instead of extending slicedata with a
+            // second, staleable representation.
+            obj->rebuild_support_associations();
 
             count ++;
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": load object %1% from %2% successfully.")%count%object_filenames[obj_index].first;

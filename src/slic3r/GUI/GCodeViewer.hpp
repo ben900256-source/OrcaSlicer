@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <float.h>
+#include <memory>
 #include <set>
 #include <unordered_set>
 
@@ -30,6 +31,7 @@ namespace GUI {
 
 class PartPlateList;
 class OpenGLManager;
+class OrganicSupportAssociationOverlay;
 
 static const float GCODE_VIEWER_SLIDER_SCALE = 0.6f;
 static const float SLIDER_DEFAULT_RIGHT_MARGIN  = 10.0f;
@@ -245,6 +247,7 @@ mutable bool m_no_render_path { false };
 
     libvgcode::Viewer m_viewer;
     bool m_loaded_as_preview{ false };
+    std::unique_ptr<OrganicSupportAssociationOverlay> m_organic_support_association_overlay;
 
 public:
     GCodeViewer();
@@ -376,4 +379,3 @@ private:
 } // namespace Slic3r
 
 #endif // slic3r_GCodeViewer_hpp_
-

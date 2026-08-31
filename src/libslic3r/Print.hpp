@@ -18,6 +18,7 @@
 #include "GCode/GCodeProcessor.hpp"
 #include "MultiMaterialSegmentation.hpp"
 #include "ObjectID.hpp"
+#include "Support/OrganicSupportAssociation.hpp"
 #include "libslic3r.h"
 
 #include <Eigen/Geometry>
@@ -345,6 +346,7 @@ public:
     ConstLayerPtrsAdaptor        layers() const         { return ConstLayerPtrsAdaptor(&m_layers); }
     ConstSupportLayerPtrsAdaptor support_layers() const { return ConstSupportLayerPtrsAdaptor(&m_support_layers); }
     const std::vector<SupportContact>& support_contacts() const { return m_support_contacts; }
+    const std::vector<OrganicSupport::Contact>& support_associations() const { return m_support_associations; }
     const Transform3d&           trafo() const          { return m_trafo; }
     // Trafo with the center_offset() applied after the transformation, to center the object in XY before slicing.
     Transform3d                  trafo_centered() const
@@ -525,6 +527,7 @@ private:
     void generate_support_material();
     void estimate_curled_extrusions();
     void simplify_extrusion_path();
+    void rebuild_support_associations();
 
     /**
      * @brief Determines the unprintable filaments for each extruder based on its printable area.
@@ -584,6 +587,9 @@ private:
     // Realized, connected Organic branch endpoints. Kept separate from the
     // transient tree graph so callers can inspect contacts after slicing.
     std::vector<SupportContact>             m_support_contacts;
+    // Derived diagnostic data. It is rebuilt from finalized paths and is not
+    // part of slicedata or project/profile serialization.
+    std::vector<OrganicSupport::Contact>     m_support_associations;
     // BBS
     std::shared_ptr<TreeSupportData>        m_tree_support_preview_cache;
 

@@ -206,6 +206,9 @@ void AppConfig::set_defaults()
     if (get("preview_dim_previous_layers").empty())
         set_bool("preview_dim_previous_layers", false);
 
+    if (get("preview_show_organic_support_associations").empty())
+        set_bool("preview_show_organic_support_associations", false);
+
     // ORCA: brightness of those dimmed layers, in percent. 0 = black, capped at 99 because
     // 100 would render them unchanged, which is what disabling the option already does
     if (get("preview_dim_previous_layers_brightness").empty())

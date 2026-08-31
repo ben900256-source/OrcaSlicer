@@ -19734,6 +19734,108 @@ msgstr ""
 msgid "Improve strength\nDid you know that you can use more wall loops and higher sparse infill density to improve the strength of the model?"
 msgstr ""
 
+msgid "Diagnostics"
+msgstr ""
+
+msgid "Organic support diagnostics"
+msgstr ""
+
+msgid "Selected organic support contact"
+msgstr ""
+
+msgid "Object / instance"
+msgstr ""
+
+msgid "Contact ID"
+msgstr ""
+
+msgid "Contact position"
+msgstr ""
+
+msgid "Association status"
+msgstr ""
+
+msgid "Unassociated"
+msgstr ""
+
+msgid "Associated"
+msgstr ""
+
+msgid "Supported layer"
+msgstr ""
+
+msgid "Supported layer Z"
+msgstr ""
+
+msgid "Support tip Z"
+msgstr ""
+
+msgid "Model contact Z"
+msgstr ""
+
+msgid "Nominal clearance"
+msgstr ""
+
+msgid "Association tolerance"
+msgstr ""
+
+msgid "Association"
+msgstr ""
+
+msgid "Extrusion ID"
+msgstr ""
+
+msgid "Source"
+msgstr ""
+
+msgid "Role"
+msgstr ""
+
+msgid "Centerline distance"
+msgstr ""
+
+msgid "Closest point"
+msgstr ""
+
+msgid "Nominal overlap"
+msgstr ""
+
+msgid "Path interval"
+msgstr ""
+
+msgid "Tolerance-only"
+msgstr ""
+
+msgid "ambiguous"
+msgstr ""
+
+msgid "stable"
+msgstr ""
+
+msgid "Tangent"
+msgstr ""
+
+msgid "Approximately centered"
+msgstr ""
+
+msgid "Unanchored"
+msgstr ""
+
+msgid "Forward span"
+msgstr ""
+
+msgid "Backward span"
+msgstr ""
+
+msgid "Pin"
+msgstr ""
+
+msgid "Lower track"
+msgstr ""
+
+msgid "Anchor IDs"
+msgstr ""
+
 #: resources/data/hints.ini: [hint:When do you need to print with the printer door opened]
 msgid "When do you need to print with the printer door opened?\nDid you know that opening the printer door can reduce the probability of extruder/hotend clogging when printing lower temperature filament with a higher enclosure temperature? There is more info about this in the Wiki."
 msgstr ""

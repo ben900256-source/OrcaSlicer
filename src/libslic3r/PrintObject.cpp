@@ -1039,6 +1039,11 @@ void PrintObject::simplify_extrusion_path()
     }
 }
 
+void PrintObject::rebuild_support_associations()
+{
+    m_support_associations = OrganicSupport::build(std::as_const(*this));
+}
+
 std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> PrintObject::prepare_adaptive_infill_data(
     const std::vector<std::pair<const Surface *, float>> &surfaces_w_bottom_z) const
 {
@@ -1091,6 +1096,7 @@ FillLightning::GeneratorPtr PrintObject::prepare_lightning_infill_data()
 
 void PrintObject::clear_layers()
 {
+    m_support_associations.clear();
     if (!m_shared_object) {
         for (Layer *l : m_layers)
             delete l;
@@ -1119,6 +1125,7 @@ SupportLayer* PrintObject::get_support_layer_at_printz(coordf_t print_z, coordf_
 void PrintObject::clear_support_layers()
 {
     m_support_contacts.clear();
+    m_support_associations.clear();
     if (!m_shared_object) {
         for (SupportLayer* l : m_support_layers)
             delete l;
@@ -1574,6 +1581,8 @@ bool PrintObject::invalidate_state_by_config_options(
 bool PrintObject::invalidate_step(PrintObjectStep step)
 {
 	bool invalidated = Inherited::invalidate_step(step);
+    if (invalidated)
+        m_support_associations.clear();
 
     // propagate to dependent steps
     if (step == posPerimeters) {
@@ -1609,6 +1618,7 @@ bool PrintObject::invalidate_all_steps()
     bool result = Inherited::invalidate_all_steps() | m_print->invalidate_all_steps();
 	// Then reset some of the depending values.
 	m_slicing_params.valid = false;
+	m_support_associations.clear();
 	return result;
 }
 

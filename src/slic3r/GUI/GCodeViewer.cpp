@@ -9,6 +9,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Support/OrganicSupportAssociation.hpp"
 //BBS: add convex hull logic for toolpath check
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
@@ -16,6 +17,7 @@
 #include "MainFrame.hpp"
 #include "Plater.hpp"
 #include "Camera.hpp"
+#include "CameraUtils.hpp"
 #include "I18N.hpp"
 #include "GUI_Utils.hpp"
 #include "GUI.hpp"
@@ -45,10 +47,582 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <limits>
+#include <optional>
 
 
 namespace Slic3r {
 namespace GUI {
+
+class OrganicSupportAssociationOverlay
+{
+    static constexpr const char *ConfigKey = "preview_show_organic_support_associations";
+
+    enum class EModel : size_t {
+        AssociatedFootprints,
+        UnassociatedFootprints,
+        SelectedOutline,
+        NominalIntervals,
+        ForwardSpans,
+        BackwardSpans,
+        Anchors,
+        ClearanceConnectors,
+        ToleranceConnectors,
+        ToleranceMarkers,
+        Count
+    };
+
+    struct InstanceSnapshot {
+        size_t instance_id { 0 };
+        Vec2d  shift { Vec2d::Zero() };
+    };
+
+    struct ObjectSnapshot {
+        size_t object_id { 0 };
+        std::vector<OrganicSupport::Contact>   contacts;
+        std::vector<OrganicSupport::PathChain> chains;
+        std::vector<InstanceSnapshot>          instances;
+    };
+
+    struct Selection {
+        size_t object_idx { 0 };
+        size_t instance_idx { 0 };
+        size_t contact_idx { 0 };
+
+        bool operator==(const Selection &rhs) const
+        {
+            return object_idx == rhs.object_idx && instance_idx == rhs.instance_idx &&
+                   contact_idx == rhs.contact_idx;
+        }
+        bool operator!=(const Selection &rhs) const { return !(*this == rhs); }
+    };
+
+    std::vector<ObjectSnapshot> m_objects;
+    std::array<GLModel, static_cast<size_t>(EModel::Count)> m_models;
+    std::optional<Selection> m_selection;
+    std::array<size_t, 2> m_built_layer_range { std::numeric_limits<size_t>::max(),
+                                                std::numeric_limits<size_t>::max() };
+    bool m_models_dirty { true };
+
+    static size_t model_id(EModel model) { return static_cast<size_t>(model); }
+
+    static GLModel::Geometry make_geometry(GLModel::Geometry::EPrimitiveType type)
+    {
+        GLModel::Geometry geometry;
+        geometry.format = { type, GLModel::Geometry::EVertexLayout::P3 };
+        return geometry;
+    }
+
+    static void add_disk(GLModel::Geometry &geometry, const Vec2d &center, double z, double radius,
+                         size_t segments = 32)
+    {
+        if (radius <= 0.)
+            return;
+        const unsigned int center_idx = static_cast<unsigned int>(geometry.vertices_count());
+        geometry.add_vertex(Vec3f(float(center.x()), float(center.y()), float(z)));
+        for (size_t i = 0; i < segments; ++i) {
+            const double angle = 2. * PI * double(i) / double(segments);
+            geometry.add_vertex(Vec3f(float(center.x() + radius * std::cos(angle)),
+                                      float(center.y() + radius * std::sin(angle)), float(z)));
+        }
+        for (size_t i = 0; i < segments; ++i)
+            geometry.add_triangle(center_idx, center_idx + 1 + unsigned(i),
+                                  center_idx + 1 + unsigned((i + 1) % segments));
+    }
+
+    static void add_annulus(GLModel::Geometry &geometry, const Vec2d &center, double z,
+                            double inner_radius, double outer_radius, size_t segments = 32)
+    {
+        if (outer_radius <= 0. || outer_radius <= inner_radius)
+            return;
+        const unsigned int first = static_cast<unsigned int>(geometry.vertices_count());
+        for (size_t i = 0; i < segments; ++i) {
+            const double angle = 2. * PI * double(i) / double(segments);
+            const Vec2d direction(std::cos(angle), std::sin(angle));
+            geometry.add_vertex(Vec3f(float(center.x() + inner_radius * direction.x()),
+                                      float(center.y() + inner_radius * direction.y()), float(z)));
+            geometry.add_vertex(Vec3f(float(center.x() + outer_radius * direction.x()),
+                                      float(center.y() + outer_radius * direction.y()), float(z)));
+        }
+        for (size_t i = 0; i < segments; ++i) {
+            const unsigned int inner = first + 2 * unsigned(i);
+            const unsigned int outer = inner + 1;
+            const unsigned int next_inner = first + 2 * unsigned((i + 1) % segments);
+            const unsigned int next_outer = next_inner + 1;
+            geometry.add_triangle(inner, outer, next_outer);
+            geometry.add_triangle(inner, next_outer, next_inner);
+        }
+    }
+
+    static void add_diamond(GLModel::Geometry &geometry, const Vec2d &center, double z, double radius)
+    {
+        const unsigned int first = static_cast<unsigned int>(geometry.vertices_count());
+        geometry.add_vertex(Vec3f(float(center.x() - radius), float(center.y()), float(z)));
+        geometry.add_vertex(Vec3f(float(center.x()), float(center.y() + radius), float(z)));
+        geometry.add_vertex(Vec3f(float(center.x() + radius), float(center.y()), float(z)));
+        geometry.add_vertex(Vec3f(float(center.x()), float(center.y() - radius), float(z)));
+        geometry.add_triangle(first, first + 1, first + 2);
+        geometry.add_triangle(first, first + 2, first + 3);
+    }
+
+    static void add_polyline_strip(GLModel::Geometry &geometry,
+                                   const OrganicSupport::PathPolyline &polyline,
+                                   const Vec2d &shift, double z, double width)
+    {
+        const double half_width = 0.5 * width;
+        for (size_t i = 1; i < polyline.size(); ++i) {
+            const Vec2d direction = polyline[i] - polyline[i - 1];
+            if (direction.squaredNorm() <= 1e-18)
+                continue;
+            const Vec2d normal(-direction.y(), direction.x());
+            const Vec2d offset = half_width * normal.normalized();
+            const Vec2d a = polyline[i - 1] + shift;
+            const Vec2d b = polyline[i] + shift;
+            const unsigned int first = static_cast<unsigned int>(geometry.vertices_count());
+            geometry.add_vertex(Vec3f(float(a.x() + offset.x()), float(a.y() + offset.y()), float(z)));
+            geometry.add_vertex(Vec3f(float(a.x() - offset.x()), float(a.y() - offset.y()), float(z)));
+            geometry.add_vertex(Vec3f(float(b.x() - offset.x()), float(b.y() - offset.y()), float(z)));
+            geometry.add_vertex(Vec3f(float(b.x() + offset.x()), float(b.y() + offset.y()), float(z)));
+            geometry.add_triangle(first, first + 1, first + 2);
+            geometry.add_triangle(first, first + 2, first + 3);
+        }
+    }
+
+    static void add_line(GLModel::Geometry &geometry, const Vec3d &a, const Vec3d &b)
+    {
+        const unsigned int first = static_cast<unsigned int>(geometry.vertices_count());
+        geometry.add_vertex(Vec3f(a.cast<float>()));
+        geometry.add_vertex(Vec3f(b.cast<float>()));
+        geometry.add_line(first, first + 1);
+    }
+
+    static const OrganicSupport::PathChain *find_chain(const ObjectSnapshot &object,
+                                                       const OrganicSupport::ExtrusionId &id)
+    {
+        for (const OrganicSupport::PathChain &chain : object.chains)
+            for (const OrganicSupport::PathLeaf &leaf : chain.leaves)
+                if (leaf.id == id)
+                    return &chain;
+        return nullptr;
+    }
+
+    static std::optional<Vec2d> point_at(const OrganicSupport::PathChain &chain, double arclength)
+    {
+        const auto polylines = OrganicSupport::clip_path_chain_interval(chain, { arclength, arclength });
+        if (polylines.empty() || polylines.front().empty())
+            return std::nullopt;
+        return polylines.front().front();
+    }
+
+    static bool layer_is_visible(const OrganicSupport::Contact &contact,
+                                 const std::vector<float> &layer_zs,
+                                 const libvgcode::Interval &range)
+    {
+        if (layer_zs.empty())
+            return false;
+        const size_t first = std::min<size_t>(range[0], layer_zs.size() - 1);
+        const size_t last  = std::min<size_t>(range[1], layer_zs.size() - 1);
+        const double low_z  = std::min(layer_zs[first], layer_zs[last]);
+        const double high_z = std::max(layer_zs[first], layer_zs[last]);
+        return contact.supported_layer_print_z >= low_z - 1e-4 &&
+               contact.supported_layer_print_z <= high_z + 1e-4;
+    }
+
+    void reset_models()
+    {
+        for (GLModel &model : m_models)
+            model.reset();
+        m_models_dirty = true;
+        m_built_layer_range = { std::numeric_limits<size_t>::max(),
+                                std::numeric_limits<size_t>::max() };
+    }
+
+    void rebuild_models(const libvgcode::Viewer &viewer)
+    {
+        reset_models();
+        const libvgcode::Interval &range = viewer.get_layers_view_range();
+        m_built_layer_range = { size_t(range[0]), size_t(range[1]) };
+        const std::vector<float> layer_zs = viewer.get_layers_zs();
+
+        std::array<GLModel::Geometry, static_cast<size_t>(EModel::Count)> geometries {
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Lines),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Lines),
+            make_geometry(GLModel::Geometry::EPrimitiveType::Triangles)
+        };
+
+        for (size_t object_idx = 0; object_idx < m_objects.size(); ++object_idx) {
+            const ObjectSnapshot &object = m_objects[object_idx];
+            for (size_t instance_idx = 0; instance_idx < object.instances.size(); ++instance_idx) {
+                const InstanceSnapshot &instance = object.instances[instance_idx];
+                for (size_t contact_idx = 0; contact_idx < object.contacts.size(); ++contact_idx) {
+                    const OrganicSupport::Contact &contact = object.contacts[contact_idx];
+                    if (!layer_is_visible(contact, layer_zs, range))
+                        continue;
+                    const Vec2d center = contact.center + instance.shift;
+                    const EModel footprint_model = contact.associations.empty() ?
+                        EModel::UnassociatedFootprints : EModel::AssociatedFootprints;
+                    add_disk(geometries[model_id(footprint_model)], center, contact.support_tip_z, contact.radius);
+
+                    if (!m_selection || m_selection->object_idx != object_idx ||
+                        m_selection->instance_idx != instance_idx || m_selection->contact_idx != contact_idx)
+                        continue;
+
+                    const double outline_width = std::clamp(0.2 * contact.radius, 0.03, 0.1);
+                    add_annulus(geometries[model_id(EModel::SelectedOutline)], center,
+                                contact.support_tip_z, contact.radius, contact.radius + outline_width);
+                    add_line(geometries[model_id(EModel::ClearanceConnectors)],
+                             Vec3d(center.x(), center.y(), contact.support_tip_z),
+                             Vec3d(center.x(), center.y(), contact.model_contact_z));
+
+                    for (const OrganicSupport::ExtrusionAssociation &association : contact.associations) {
+                        const OrganicSupport::PathChain *chain = find_chain(object, association.extrusion_id);
+                        if (chain == nullptr)
+                            continue;
+                        const double path_z = contact.supported_layer_print_z;
+                        const double strip_width = std::clamp(0.25 * association.width, 0.05, 0.14);
+                        if (!association.path_arclength_interval) {
+                            const Vec2d closest = association.closest_point + instance.shift;
+                            add_line(geometries[model_id(EModel::ToleranceConnectors)],
+                                     Vec3d(center.x(), center.y(), path_z),
+                                     Vec3d(closest.x(), closest.y(), path_z));
+                            add_disk(geometries[model_id(EModel::ToleranceMarkers)], closest, path_z,
+                                     std::max(0.06, 0.3 * association.width), 16);
+                            continue;
+                        }
+
+                        const OrganicSupport::PathInterval &nominal = *association.path_arclength_interval;
+                        for (const OrganicSupport::PathPolyline &polyline :
+                             OrganicSupport::clip_path_chain_interval(*chain, nominal))
+                            add_polyline_strip(geometries[model_id(EModel::NominalIntervals)], polyline,
+                                               instance.shift, path_z, strip_width);
+
+                        if (!association.planned_material_unsupported_span)
+                            continue;
+                        const auto append_direction = [&](const OrganicSupport::DirectionalUnsupportedSpan &direction,
+                                                          bool forward, EModel model) {
+                            const std::optional<double> distance = direction.span ? direction.span : direction.unanchored_distance;
+                            if (distance) {
+                                const OrganicSupport::PathInterval interval = forward ?
+                                    OrganicSupport::PathInterval{ nominal.end, nominal.end + *distance } :
+                                    OrganicSupport::PathInterval{ nominal.begin - *distance, nominal.begin };
+                                for (const OrganicSupport::PathPolyline &polyline :
+                                     OrganicSupport::clip_path_chain_interval(*chain, interval))
+                                    add_polyline_strip(geometries[model_id(model)], polyline,
+                                                       instance.shift, path_z, strip_width);
+                            }
+                            for (const OrganicSupport::PlannedMaterialAnchor &anchor : direction.anchors) {
+                                for (const OrganicSupport::PathPolyline &polyline :
+                                     OrganicSupport::clip_path_chain_interval(*chain, anchor.interval))
+                                    add_polyline_strip(geometries[model_id(EModel::Anchors)], polyline,
+                                                       instance.shift, path_z, strip_width);
+                                const double midpoint = 0.5 * (anchor.interval.begin + anchor.interval.end);
+                                if (const std::optional<Vec2d> marker = point_at(*chain, midpoint)) {
+                                    const Vec2d marker_center = *marker + instance.shift;
+                                    const double marker_radius = std::max(0.07, 0.35 * association.width);
+                                    if (anchor.type == OrganicSupport::AnchorType::Pin)
+                                        add_disk(geometries[model_id(EModel::Anchors)], marker_center,
+                                                 path_z, marker_radius, 16);
+                                    else
+                                        add_diamond(geometries[model_id(EModel::Anchors)], marker_center,
+                                                    path_z, marker_radius);
+                                }
+                            }
+                        };
+                        append_direction(association.planned_material_unsupported_span->forward,
+                                         true, EModel::ForwardSpans);
+                        append_direction(association.planned_material_unsupported_span->backward,
+                                         false, EModel::BackwardSpans);
+                    }
+                }
+            }
+        }
+
+        const std::array<ColorRGBA, static_cast<size_t>(EModel::Count)> colors {
+            ColorRGBA(0.00f, 0.72f, 0.68f, 0.42f),
+            ColorRGBA(0.95f, 0.12f, 0.12f, 0.45f),
+            ColorRGBA(1.00f, 0.90f, 0.05f, 0.95f),
+            ColorRGBA(1.00f, 1.00f, 1.00f, 0.95f),
+            ColorRGBA(1.00f, 0.45f, 0.05f, 0.92f),
+            ColorRGBA(0.10f, 0.45f, 1.00f, 0.92f),
+            ColorRGBA(0.15f, 0.92f, 0.25f, 0.95f),
+            ColorRGBA(1.00f, 0.90f, 0.05f, 0.95f),
+            ColorRGBA(1.00f, 1.00f, 1.00f, 0.95f),
+            ColorRGBA(1.00f, 1.00f, 1.00f, 0.95f)
+        };
+        for (size_t i = 0; i < m_models.size(); ++i) {
+            if (!geometries[i].is_empty()) {
+                geometries[i].color = colors[i];
+                m_models[i].init_from(std::move(geometries[i]));
+            }
+        }
+        m_models_dirty = false;
+    }
+
+    const std::pair<const ObjectSnapshot *, const OrganicSupport::Contact *> selected_contact() const
+    {
+        if (!m_selection || m_selection->object_idx >= m_objects.size())
+            return { nullptr, nullptr };
+        const ObjectSnapshot &object = m_objects[m_selection->object_idx];
+        if (m_selection->instance_idx >= object.instances.size() ||
+            m_selection->contact_idx >= object.contacts.size())
+            return { nullptr, nullptr };
+        return { &object, &object.contacts[m_selection->contact_idx] };
+    }
+
+    static std::string format_mm(double value)
+    {
+        char buffer[64];
+        ::sprintf(buffer, "%.4f mm", value);
+        return buffer;
+    }
+
+    static std::string format_interval(const OrganicSupport::PathInterval &interval)
+    {
+        char buffer[96];
+        ::sprintf(buffer, "[%.4f, %.4f] mm", interval.begin, interval.end);
+        return buffer;
+    }
+
+    static std::string format_point(const Vec2d &point)
+    {
+        char buffer[96];
+        ::sprintf(buffer, "(%.4f, %.4f) mm", point.x(), point.y());
+        return buffer;
+    }
+
+public:
+    void load(const Print &print)
+    {
+        reset();
+        for (const PrintObject *print_object : print.objects()) {
+            if (print_object->support_associations().empty())
+                continue;
+            ObjectSnapshot object;
+            object.object_id = print_object->id().id;
+            object.contacts = print_object->support_associations();
+            object.chains = OrganicSupport::extract_finalized_path_chains(*print_object);
+            for (const PrintInstance &instance : print_object->instances()) {
+                const Point shift = instance.shift_without_plate_offset();
+                object.instances.push_back({ instance.id,
+                    Vec2d(unscale<double>(shift.x()), unscale<double>(shift.y())) });
+            }
+            if (!object.instances.empty())
+                m_objects.push_back(std::move(object));
+        }
+        m_models_dirty = true;
+    }
+
+    void reset()
+    {
+        reset_models();
+        m_objects.clear();
+        m_selection.reset();
+    }
+
+    bool has_data() const { return !m_objects.empty(); }
+
+    bool is_visible() const
+    {
+        return has_data() && get_app_config()->get_bool(ConfigKey);
+    }
+
+    void toggle_visibility()
+    {
+        const bool visible = !get_app_config()->get_bool(ConfigKey);
+        get_app_config()->set_bool(ConfigKey, visible);
+        if (!visible) {
+            m_selection.reset();
+            reset_models();
+        }
+    }
+
+    void render(const libvgcode::Viewer &viewer, float scale)
+    {
+        if (!is_visible())
+            return;
+        const libvgcode::Interval &range = viewer.get_layers_view_range();
+        if (m_models_dirty || m_built_layer_range != std::array<size_t, 2>{ size_t(range[0]), size_t(range[1]) })
+            rebuild_models(viewer);
+
+        const Camera &camera = wxGetApp().plater()->get_camera();
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::GetIO().WantCaptureMouse) {
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const std::vector<float> layer_zs = viewer.get_layers_zs();
+            double best_distance = std::numeric_limits<double>::infinity();
+            std::optional<Selection> nearest;
+            for (size_t object_idx = 0; object_idx < m_objects.size(); ++object_idx) {
+                const ObjectSnapshot &object = m_objects[object_idx];
+                for (size_t instance_idx = 0; instance_idx < object.instances.size(); ++instance_idx) {
+                    const InstanceSnapshot &instance = object.instances[instance_idx];
+                    for (size_t contact_idx = 0; contact_idx < object.contacts.size(); ++contact_idx) {
+                        const OrganicSupport::Contact &contact = object.contacts[contact_idx];
+                        if (!layer_is_visible(contact, layer_zs, range))
+                            continue;
+                        const Vec2d center = contact.center + instance.shift;
+                        const Point projected = CameraUtils::project(camera,
+                            Vec3d(center.x(), center.y(), contact.support_tip_z));
+                        const Point projected_x = CameraUtils::project(camera,
+                            Vec3d(center.x() + contact.radius, center.y(), contact.support_tip_z));
+                        const Point projected_y = CameraUtils::project(camera,
+                            Vec3d(center.x(), center.y() + contact.radius, contact.support_tip_z));
+                        const double projected_radius = std::max(
+                            Vec2d(double(projected_x.x() - projected.x()), double(projected_x.y() - projected.y())).norm(),
+                            Vec2d(double(projected_y.x() - projected.x()), double(projected_y.y() - projected.y())).norm());
+                        const double hit_radius = std::max(8.0 * scale, projected_radius);
+                        const double distance = Vec2d(double(projected.x()) - mouse.x,
+                                                      double(projected.y()) - mouse.y).norm();
+                        if (distance <= hit_radius && distance < best_distance) {
+                            best_distance = distance;
+                            nearest = Selection{ object_idx, instance_idx, contact_idx };
+                        }
+                    }
+                }
+            }
+            if (nearest != m_selection) {
+                m_selection = nearest;
+                reset_models();
+                rebuild_models(viewer);
+            }
+        }
+
+        GLShaderProgram *current_shader = wxGetApp().get_current_shader();
+        if (current_shader != nullptr)
+            current_shader->stop_using();
+        GLShaderProgram *shader = wxGetApp().get_shader("flat");
+        if (shader == nullptr) {
+            if (current_shader != nullptr)
+                current_shader->start_using();
+            return;
+        }
+
+        const GLboolean depth_test_enabled = ::glIsEnabled(GL_DEPTH_TEST);
+        const GLboolean blend_enabled = ::glIsEnabled(GL_BLEND);
+        GLboolean depth_write_enabled = GL_TRUE;
+        GLfloat line_width = 1.f;
+        GLint blend_src_rgb = GL_ONE;
+        GLint blend_dst_rgb = GL_ZERO;
+        GLint blend_src_alpha = GL_ONE;
+        GLint blend_dst_alpha = GL_ZERO;
+        ::glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_write_enabled);
+        ::glGetFloatv(GL_LINE_WIDTH, &line_width);
+        ::glGetIntegerv(GL_BLEND_SRC_RGB, &blend_src_rgb);
+        ::glGetIntegerv(GL_BLEND_DST_RGB, &blend_dst_rgb);
+        ::glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src_alpha);
+        ::glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst_alpha);
+        glsafe(::glDisable(GL_DEPTH_TEST));
+        glsafe(::glDepthMask(GL_FALSE));
+        glsafe(::glEnable(GL_BLEND));
+        glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+        glsafe(::glLineWidth(std::max(1.f, 2.f * scale)));
+
+        shader->start_using();
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        for (GLModel &model : m_models)
+            if (model.is_initialized())
+                model.render(shader);
+        shader->stop_using();
+
+        glsafe(::glLineWidth(line_width));
+        glsafe(::glBlendFuncSeparate(blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha));
+        glsafe(::glDepthMask(depth_write_enabled));
+        if (depth_test_enabled) glsafe(::glEnable(GL_DEPTH_TEST)); else glsafe(::glDisable(GL_DEPTH_TEST));
+        if (blend_enabled) glsafe(::glEnable(GL_BLEND)); else glsafe(::glDisable(GL_BLEND));
+        if (current_shader != nullptr)
+            current_shader->start_using();
+    }
+
+    void render_selected_details(ImGuiWrapper &imgui, float child_height, float window_padding) const
+    {
+        const auto [object, contact] = selected_contact();
+        if (object == nullptr || contact == nullptr || !m_selection)
+            return;
+        const InstanceSnapshot &instance = object->instances[m_selection->instance_idx];
+
+        ImGui::Dummy({ window_padding, window_padding });
+        ImGui::SameLine();
+        imgui.title(_u8L("Selected organic support contact"));
+        ImGui::BeginChild("organic_support_diagnostic_details", ImVec2(-1.f, child_height), true,
+                          ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_AlwaysUseWindowPadding);
+        auto row = [&imgui](const std::string &label, const std::string &value) {
+            imgui.text(label + ": " + value);
+        };
+        row(_u8L("Object / instance"), std::to_string(object->object_id) + " / " + std::to_string(instance.instance_id));
+        row(_u8L("Contact ID"), std::to_string(contact->contact_id));
+        row(_u8L("Contact position"), format_point(contact->center + instance.shift));
+        row(_u8L("Association status"), contact->associations.empty() ? _u8L("Unassociated") : _u8L("Associated"));
+        row(_u8L("Radius"), format_mm(contact->radius));
+        row(_u8L("Supported layer"), std::to_string(contact->supported_layer_id));
+        row(_u8L("Supported layer Z"), format_mm(contact->supported_layer_print_z));
+        row(_u8L("Support tip Z"), format_mm(contact->support_tip_z));
+        row(_u8L("Model contact Z"), format_mm(contact->model_contact_z));
+        row(_u8L("Nominal clearance"), format_mm(contact->nominal_clearance));
+        row(_u8L("Association tolerance"), format_mm(contact->association_tolerance));
+
+        for (size_t association_idx = 0; association_idx < contact->associations.size(); ++association_idx) {
+            const OrganicSupport::ExtrusionAssociation &association = contact->associations[association_idx];
+            ImGui::Separator();
+            imgui.bold_text(_u8L("Association") + " " + std::to_string(association_idx + 1));
+            row(_u8L("Extrusion ID"), association.extrusion_id.to_string());
+            row(_u8L("Source"), OrganicSupport::extrusion_source_name(association.extrusion_id.source));
+            row(_u8L("Role"), _u8L(ExtrusionEntity::role_to_string(association.role)) +
+                              " (" + OrganicSupport::extrusion_role_name(association.role) + ")");
+            row(_u8L("Width"), format_mm(association.width));
+            row(_u8L("Closest point"), format_point(association.closest_point + instance.shift));
+            row(_u8L("Centerline distance"), format_mm(association.centerline_distance));
+            row(_u8L("Nominal overlap"), format_mm(association.nominal_overlap_length));
+            row(_u8L("Path interval"), association.path_arclength_interval ?
+                format_interval(*association.path_arclength_interval) : _u8L("Tolerance-only"));
+            char tangent[128];
+            ::sprintf(tangent, "(%.4f, %.4f) - %s", association.tangent.x(), association.tangent.y(),
+                      association.tangent_ambiguous ? _u8L("ambiguous").c_str() : _u8L("stable").c_str());
+            row(_u8L("Tangent"), tangent);
+            row(_u8L("Approximately centered"), association.approximately_centered ? _u8L("Yes") : _u8L("No"));
+
+            if (!association.planned_material_unsupported_span)
+                continue;
+            const auto direction_text = [](const OrganicSupport::DirectionalUnsupportedSpan &direction) {
+                if (direction.span)
+                    return format_mm(*direction.span);
+                if (direction.unanchored_distance)
+                    return _u8L("Unanchored") + " (" + format_mm(*direction.unanchored_distance) + ")";
+                return _u8L("None");
+            };
+            row(_u8L("Forward span"), direction_text(association.planned_material_unsupported_span->forward));
+            row(_u8L("Backward span"), direction_text(association.planned_material_unsupported_span->backward));
+
+            std::vector<std::string> anchor_ids;
+            const auto append_anchors = [&anchor_ids](const OrganicSupport::DirectionalUnsupportedSpan &direction) {
+                for (const OrganicSupport::PlannedMaterialAnchor &anchor : direction.anchors) {
+                    if (anchor.type == OrganicSupport::AnchorType::Pin)
+                        anchor_ids.push_back(_u8L("Pin") + " " + std::to_string(anchor.contact_id) +
+                                             " " + format_interval(anchor.interval));
+                    else if (anchor.extrusion_id)
+                        anchor_ids.push_back(_u8L("Lower track") + " " + anchor.extrusion_id->to_string() +
+                                             " " + format_interval(anchor.interval));
+                }
+            };
+            append_anchors(association.planned_material_unsupported_span->forward);
+            append_anchors(association.planned_material_unsupported_span->backward);
+            std::sort(anchor_ids.begin(), anchor_ids.end());
+            anchor_ids.erase(std::unique(anchor_ids.begin(), anchor_ids.end()), anchor_ids.end());
+            std::string anchors;
+            for (const std::string &id : anchor_ids) {
+                if (!anchors.empty()) anchors += ", ";
+                anchors += id;
+            }
+            row(_u8L("Anchor IDs"), anchors.empty() ? _u8L("None") : anchors);
+        }
+        ImGui::EndChild();
+    }
+};
 
 //BBS translation of EViewType
 //const std::string EViewType_Map[(int) GCodeViewer::EViewType::Count] = {
@@ -980,6 +1554,7 @@ GCodeViewer::GCodeViewer()
 {
     m_moves_slider  = new IMSlider(0, 0, 0, 100, wxSL_HORIZONTAL);
     m_layers_slider = new IMSlider(0, 0, 0, 100, wxSL_VERTICAL);
+    m_organic_support_association_overlay = std::make_unique<OrganicSupportAssociationOverlay>();
 }
 
 GCodeViewer::~GCodeViewer()
@@ -1179,6 +1754,8 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         wxGetApp().plater()->schedule_background_process();
         return;
     }
+
+    m_organic_support_association_overlay->load(print);
 
     // convert data from PrusaSlicer format to libvgcode format
     libvgcode::GCodeInputData data = libvgcode::convert(gcode_result, str_tool_colors, str_color_print_colors, m_viewer);
@@ -1495,6 +2072,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 void GCodeViewer::load_as_preview(libvgcode::GCodeInputData&& data)
 {
     m_loaded_as_preview = true;
+    m_organic_support_association_overlay->reset();
 
     m_move_type_counts.fill(0);
     for (auto& move_type_times : m_move_type_times)
@@ -1556,6 +2134,8 @@ void GCodeViewer::reset()
     m_last_result_id = -1;
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
+    if (m_organic_support_association_overlay)
+        m_organic_support_association_overlay->reset();
 
     m_viewer.reset();
 
@@ -1588,6 +2168,7 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
         return;
 
     render_toolpaths();
+    m_organic_support_association_overlay->render(m_viewer, m_scale);
 
     float legend_height = 0.0f;
     render_legend(legend_height, canvas_width, canvas_height, right_margin);
@@ -4556,6 +5137,24 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         }
     }
 
+    if (m_organic_support_association_overlay->has_data()) {
+        ImGui::Spacing();
+        ImGui::Dummy({ window_padding, window_padding });
+        ImGui::SameLine();
+        imgui.title(_u8L("Diagnostics"));
+        const bool overlay_visible = m_organic_support_association_overlay->is_visible();
+        append_item(EItemType::Circle, ColorRGBA(0.00f, 0.72f, 0.68f, 1.0f),
+                    { { _u8L("Organic support diagnostics"), 0.f } }, true,
+                    predictable_icon_pos, overlay_visible, [this]() {
+            m_organic_support_association_overlay->toggle_visibility();
+            wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+            wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+        });
+        if (overlay_visible)
+            m_organic_support_association_overlay->render_selected_details(
+                imgui, child_height, window_padding);
+    }
+
 
     // total estimated printing time section
     ImGui::Spacing();
@@ -4727,4 +5326,3 @@ void GCodeViewer::render_slider(int canvas_width, int canvas_height) {
 
 } // namespace GUI
 } // namespace Slic3r
-
