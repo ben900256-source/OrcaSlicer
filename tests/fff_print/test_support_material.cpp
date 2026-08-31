@@ -298,10 +298,11 @@ double support_path_length(const PrintObject &object)
     return length;
 }
 
-bool round_terminal_layers_are_continuous(const PrintObject &object)
+bool round_terminal_necks_are_concentric_and_continuous(const PrintObject &object)
 {
     const ConstSupportLayerPtrsAdaptor layers = object.support_layers();
     size_t checked = 0;
+    size_t concentric_checked = 0;
     for (const SupportContact &contact : object.support_contacts()) {
         size_t layer_idx = 0;
         while (layer_idx < layers.size() && std::abs(layers[layer_idx]->print_z - contact.support_tip_z) >= EPSILON)
@@ -335,10 +336,28 @@ bool round_terminal_layers_are_continuous(const PrintObject &object)
                 }
             if (overlapping == nullptr)
                 return false;
+            if (depth == 1) {
+                const size_t contacts_in_island = std::count_if(
+                    object.support_contacts().begin(), object.support_contacts().end(),
+                    [&](const SupportContact &candidate) {
+                        return std::abs(candidate.support_tip_z - contact.support_tip_z) < EPSILON &&
+                               overlapping->contains(candidate.position);
+                    });
+                const MinAreaBoundigBox box(*overlapping);
+                const double short_side = double(std::min(box.width(), box.height()));
+                const double long_side  = double(std::max(box.width(), box.height()));
+                if (contacts_in_island == 1 && short_side > 0. && long_side / short_side <= 1.1) {
+                    ++ concentric_checked;
+                    const double center_offset = unscale<double>(
+                        (overlapping->contour.centroid() - contact.position).cast<double>().norm());
+                    if (center_offset > 0.01)
+                        return false;
+                }
+            }
             upper = overlapping;
         }
     }
-    return checked >= 6;
+    return checked >= 6 && concentric_checked >= 6;
 }
 
 } // namespace
@@ -828,7 +847,7 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
         TerminalFootprintStats footprints;
         double                 support_volume;
         double                 support_path_length;
-        bool                   terminal_layers_are_continuous;
+        bool                   terminal_necks_are_concentric_and_continuous;
     };
     CHECK_FALSE(DynamicPrintConfig::full_print_config().opt_bool("tree_support_round_tip"));
 
@@ -851,7 +870,8 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
         const PrintObject &object = *print.objects().front();
         const TerminalFootprintStats footprints = unobstructed_terminal_footprint_stats(object);
         const double volume = support_volume(object);
-        return SliceResult{ footprints, volume, support_path_length(object), round_terminal_layers_are_continuous(object) };
+        return SliceResult{ footprints, volume, support_path_length(object),
+                            round_terminal_necks_are_concentric_and_continuous(object) };
     };
 
     for (const auto &[layer_height, top_gap] : std::array<std::pair<double, double>, 2>{
@@ -863,10 +883,10 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
                     baseline.footprints.max_aspect_ratio, baseline.support_volume, baseline.support_path_length,
                     candidate.footprints.count, candidate.footprints.median_aspect_ratio,
                     candidate.footprints.max_aspect_ratio, candidate.support_volume, candidate.support_path_length,
-                    candidate.terminal_layers_are_continuous);
+                    candidate.terminal_necks_are_concentric_and_continuous);
 
             REQUIRE(candidate.footprints.count >= 6);
-            CHECK(candidate.terminal_layers_are_continuous);
+            CHECK(candidate.terminal_necks_are_concentric_and_continuous);
             CHECK(candidate.footprints.median_aspect_ratio <= 1.05);
             CHECK(candidate.footprints.max_aspect_ratio <= 1.10);
             CHECK(candidate.support_volume <= 1.15 * baseline.support_volume);

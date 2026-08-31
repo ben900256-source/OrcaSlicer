@@ -3890,10 +3890,13 @@ void organic_draw_branches(
                     if (round_tip && branch.has_tip) {
                         // A tube cut by a horizontal layer is elliptical when the branch is
                         // inclined. Pin supports need discrete round terminal footprints, so
-                        // replace only the final two cuts at their collision-planned centers.
-                        // The path planner limits movement between adjacent centers; retaining
-                        // two circles keeps them overlapped with each other and with the
-                        // untouched tube below. Collision and bed clipping still run afterward.
+                        // replace only the final two cuts with a short vertical neck centered
+                        // on the realized contact. Using each node's independently planned
+                        // center would leave the upper pin slightly cantilevered over a leaning
+                        // branch. Retain each layer's planned radius so the lower circle still
+                        // grows into the untouched tube below. Collision and bed clipping still
+                        // run afterward.
+                        const Point terminal_center = branch.path.back()->state.result_on_layer;
                         const size_t num_round_layers = std::min<size_t>(2, branch.path.size());
                         for (size_t distance_to_tip = 0; distance_to_tip < num_round_layers; ++ distance_to_tip) {
                             const SupportElement &element = *branch.path[branch.path.size() - 1 - distance_to_tip];
@@ -3902,7 +3905,7 @@ void organic_draw_branches(
                                 continue;
 
                             Polygon circle = make_circle(support_element_radius(config, element), SUPPORT_TREE_CIRCLE_RESOLUTION);
-                            circle.translate(element.state.result_on_layer);
+                            circle.translate(terminal_center);
                             slices[circular_layer - layer_begin] = Polygons{ std::move(circle) };
                         }
                     }
