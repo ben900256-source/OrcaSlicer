@@ -2911,6 +2911,22 @@ static std::pair<int, int> discretize_circle(const Vec3f &center, const Vec3f &n
     return { begin, int(pts.size()) };
 }
 
+static Polygon make_terminal_transition_ellipse(coord_t radius, double major_scale,
+                                                const Vec2d &major_axis, const Point &center)
+{
+    Polygon ellipse = make_circle(radius, SUPPORT_TREE_CIRCLE_RESOLUTION);
+    if (major_scale > 1. + EPSILON && major_axis.squaredNorm() > EPSILON) {
+        const Vec2d axis = major_axis.normalized();
+        for (Point &point : ellipse.points) {
+            Vec2d offset = point.cast<double>();
+            offset += (major_scale - 1.) * offset.dot(axis) * axis;
+            point = Point(coord_t(std::llround(offset.x())), coord_t(std::llround(offset.y())));
+        }
+    }
+    ellipse.translate(center);
+    return ellipse;
+}
+
 // Returns Z span of the generated mesh.
 static std::pair<float, float> extrude_branch(
     const std::vector<const SupportElement*>&path,
@@ -3889,24 +3905,46 @@ void organic_draw_branches(
 
                     if (round_tip && branch.has_tip) {
                         // A tube cut by a horizontal layer is elliptical when the branch is
-                        // inclined. Pin supports need discrete round terminal footprints, so
-                        // replace only the final two cuts with a short vertical neck centered
-                        // on the realized contact. Using each node's independently planned
-                        // center would leave the upper pin slightly cantilevered over a leaning
-                        // branch. Retain each layer's planned radius so the lower circle still
-                        // grows into the untouched tube below. Collision and bed clipping still
-                        // run afterward.
+                        // inclined. Taper the final cuts through progressively smaller,
+                        // branch-aligned ellipses into a round pin at the realized contact.
+                        // Interpolating both the center and eccentricity spreads the transition
+                        // over several layers instead of leaving either an abrupt vertical neck
+                        // or a single cantilevered terminal circle. Collision and bed clipping
+                        // still run afterward.
                         const Point terminal_center = branch.path.back()->state.result_on_layer;
-                        const size_t num_round_layers = std::min<size_t>(2, branch.path.size());
-                        for (size_t distance_to_tip = 0; distance_to_tip < num_round_layers; ++ distance_to_tip) {
-                            const SupportElement &element = *branch.path[branch.path.size() - 1 - distance_to_tip];
-                            const LayerIndex circular_layer = element.state.layer_idx;
-                            if (circular_layer < layer_begin || circular_layer >= layer_begin + LayerIndex(slices.size()))
+                        const Vec2d terminal_center_f = terminal_center.cast<double>();
+                        const size_t num_transition_layers = std::min<size_t>(4, branch.path.size());
+                        for (size_t distance_to_tip = 0; distance_to_tip < num_transition_layers; ++ distance_to_tip) {
+                            const size_t element_idx = branch.path.size() - 1 - distance_to_tip;
+                            const SupportElement &element = *branch.path[element_idx];
+                            const LayerIndex transition_layer = element.state.layer_idx;
+                            if (transition_layer < layer_begin || transition_layer >= layer_begin + LayerIndex(slices.size()))
                                 continue;
 
-                            Polygon circle = make_circle(support_element_radius(config, element), SUPPORT_TREE_CIRCLE_RESOLUTION);
-                            circle.translate(terminal_center);
-                            slices[circular_layer - layer_begin] = Polygons{ std::move(circle) };
+                            const double transition = num_transition_layers <= 1 ? 0. :
+                                double(distance_to_tip) / double(num_transition_layers - 1);
+                            const Vec2d planned_center = element.state.result_on_layer.cast<double>();
+                            const Vec2d center = terminal_center_f +
+                                transition * (planned_center - terminal_center_f);
+
+                            const size_t lower_idx = element_idx > 0 ? element_idx - 1 : element_idx;
+                            const size_t upper_idx = std::min(element_idx + 1, branch.path.size() - 1);
+                            const Vec2d branch_direction =
+                                (branch.path[upper_idx]->state.result_on_layer -
+                                 branch.path[lower_idx]->state.result_on_layer).cast<double>();
+                            const double z_distance = layer_z(slicing_params, config,
+                                branch.path[upper_idx]->state.layer_idx) - layer_z(slicing_params, config,
+                                branch.path[lower_idx]->state.layer_idx);
+                            const double xy_distance = unscale<double>(branch_direction.norm());
+                            const double natural_major_scale = z_distance > EPSILON ?
+                                std::clamp(std::sqrt(1. + sqr(xy_distance / z_distance)), 1., 1.5) : 1.;
+                            const double major_scale = 1. + transition * (natural_major_scale - 1.);
+                            const Point ellipse_center(coord_t(std::llround(center.x())),
+                                                       coord_t(std::llround(center.y())));
+                            Polygon ellipse = make_terminal_transition_ellipse(
+                                support_element_radius(config, element), major_scale,
+                                branch_direction, ellipse_center);
+                            slices[transition_layer - layer_begin] = Polygons{ std::move(ellipse) };
                         }
                     }
 
