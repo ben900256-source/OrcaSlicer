@@ -12,7 +12,7 @@
 	"bottom_shell_thickness": "0.5",
 	"support_interface_top_layers": "0",
 	"support_interface_bottom_layers": "0",
-	"support_top_z_distance": "0.06",
+	"support_top_z_distance": "0",
 	"support_line_width": "0.4",
 	"tree_support_tip_diameter": "0.4",
 	"tree_support_round_tip": "1",

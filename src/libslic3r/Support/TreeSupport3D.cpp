@@ -7,6 +7,7 @@
 // CuraEngine is released under the terms of the AGPLv3 or higher.
 
 #include "TreeSupport3D.hpp"
+#include "AABBMesh.hpp"
 #include "AABBTreeIndirect.hpp"
 #include "AABBTreeLines.hpp"
 #include "BuildVolume.hpp"
@@ -25,6 +26,7 @@
 #include "I18N.hpp"
 
 #include <cassert>
+#include <array>
 #include <chrono>
 #include <optional>
 #include <stdio.h>
@@ -2927,6 +2929,250 @@ static Polygon make_terminal_transition_ellipse(coord_t radius, double major_sca
     return ellipse;
 }
 
+static constexpr double resin_pin_runup_height_mm = 0.8;
+static constexpr double resin_pin_branch_approach_height_mm = 1.6;
+static constexpr double resin_pin_branch_landing_scale = 1.12;
+static constexpr double resin_pin_cone_landing_inset = 0.2;
+static constexpr double resin_pin_minimum_layer_support = 0.98;
+static constexpr size_t resin_pin_tilt_bisection_iterations = 12;
+
+static double maximum_branch_slope(const TreeSupportSettings &config)
+{
+    return config.layer_height > 0 ?
+        double(config.maximum_move_distance) / double(config.layer_height) : 0.;
+}
+
+static size_t terminal_runup_base_idx(const std::vector<const SupportElement*> &path,
+                                      const TreeSupportSettings &config,
+                                      const SlicingParameters &slicing_params)
+{
+    const double terminal_z = layer_z(slicing_params, config, path.back()->state.layer_idx);
+    const size_t max_transition_layers = path.size() - 1;
+    size_t num_transition_layers = 1;
+    for (size_t distance_to_tip = 1; distance_to_tip < max_transition_layers; ++ distance_to_tip) {
+        num_transition_layers = distance_to_tip + 1;
+        const SupportElement &element = *path[path.size() - 1 - distance_to_tip];
+        if (terminal_z - layer_z(slicing_params, config, element.state.layer_idx) >=
+            resin_pin_runup_height_mm - EPSILON)
+            break;
+    }
+    return path.size() - num_transition_layers;
+}
+
+static size_t terminal_approach_start_idx(const std::vector<const SupportElement*> &path,
+                                          size_t runup_base_idx,
+                                          const TreeSupportSettings &config,
+                                          const SlicingParameters &slicing_params)
+{
+    const double runup_base_z = layer_z(slicing_params, config,
+                                        path[runup_base_idx]->state.layer_idx);
+    size_t approach_start_idx = runup_base_idx;
+    while (approach_start_idx > 0 &&
+           runup_base_z - layer_z(slicing_params, config,
+                                  path[approach_start_idx]->state.layer_idx) <
+               resin_pin_branch_approach_height_mm - EPSILON)
+        -- approach_start_idx;
+    return approach_start_idx;
+}
+
+struct DirectTerminalGeometry
+{
+    std::vector<Vec2d> centers;
+    std::vector<double> radius_scales;
+    Vec2d slope{ Vec2d::Zero() };
+    size_t approach_start_idx{ 0 };
+};
+
+static DirectTerminalGeometry make_direct_terminal_geometry(
+    const std::vector<const SupportElement*> &path,
+    size_t runup_base_idx,
+    const TerminalContactFrame &frame,
+    double tilt_scale,
+    const TreeSupportSettings &config,
+    const SlicingParameters &slicing_params)
+{
+    DirectTerminalGeometry geometry;
+    geometry.centers.reserve(path.size());
+    geometry.radius_scales.assign(path.size(), 1.);
+    for (const SupportElement *element : path)
+        geometry.centers.emplace_back(unscaled<double>(element->state.result_on_layer));
+
+    const Vec2d desired_slope = frame.axis.head<2>() / frame.axis.z();
+    geometry.slope = tilt_scale * desired_slope;
+    geometry.approach_start_idx = terminal_approach_start_idx(
+        path, runup_base_idx, config, slicing_params);
+
+    const double terminal_z = layer_z(slicing_params, config, path.back()->state.layer_idx);
+    const double base_z = layer_z(slicing_params, config, path[runup_base_idx]->state.layer_idx);
+    const double start_z = layer_z(slicing_params, config,
+                                   path[geometry.approach_start_idx]->state.layer_idx);
+    const double approach_height = base_z - start_z;
+    const Vec2d contact_center = unscaled<double>(frame.position);
+    const Vec2d base_center = contact_center - geometry.slope * (terminal_z - base_z);
+    const Vec2d start_center = geometry.centers[geometry.approach_start_idx];
+
+    Vec2d start_tangent = Vec2d::Zero();
+    if (geometry.approach_start_idx > 0) {
+        const size_t lower_idx = geometry.approach_start_idx - 1;
+        const double lower_z = layer_z(slicing_params, config, path[lower_idx]->state.layer_idx);
+        if (start_z - lower_z > EPSILON)
+            start_tangent = (start_center - geometry.centers[lower_idx]) / (start_z - lower_z);
+    } else if (geometry.approach_start_idx + 1 < path.size()) {
+        const size_t upper_idx = geometry.approach_start_idx + 1;
+        const double upper_z = layer_z(slicing_params, config, path[upper_idx]->state.layer_idx);
+        if (upper_z - start_z > EPSILON)
+            start_tangent = (geometry.centers[upper_idx] - start_center) / (upper_z - start_z);
+    }
+
+    // A cubic Hermite segment preserves the incoming Organic tangent and
+    // reaches the cone socket with the selected surface-normal tangent.
+    for (size_t idx = geometry.approach_start_idx + 1; idx <= runup_base_idx; ++ idx) {
+        const double z = layer_z(slicing_params, config, path[idx]->state.layer_idx);
+        const double t = approach_height > EPSILON ?
+            std::clamp((z - start_z) / approach_height, 0., 1.) : 1.;
+        const double t2 = t * t;
+        const double t3 = t2 * t;
+        const double h00 = 2. * t3 - 3. * t2 + 1.;
+        const double h10 = t3 - 2. * t2 + t;
+        const double h01 = -2. * t3 + 3. * t2;
+        const double h11 = t3 - t2;
+        geometry.centers[idx] = h00 * start_center + h10 * approach_height * start_tangent +
+                                h01 * base_center + h11 * approach_height * geometry.slope;
+        const double swell = t2 * (3. - 2. * t);
+        geometry.radius_scales[idx] = 1. + swell * (resin_pin_branch_landing_scale - 1.);
+    }
+    for (size_t idx = runup_base_idx + 1; idx < path.size(); ++ idx) {
+        const double z = layer_z(slicing_params, config, path[idx]->state.layer_idx);
+        geometry.centers[idx] = contact_center - geometry.slope * (terminal_z - z);
+        geometry.radius_scales[idx] = resin_pin_branch_landing_scale;
+    }
+    return geometry;
+}
+
+static Polygon direct_terminal_footprint(
+    const std::vector<const SupportElement*> &path,
+    const DirectTerminalGeometry &geometry,
+    size_t runup_base_idx,
+    size_t element_idx,
+    const TreeSupportSettings &config,
+    const SlicingParameters &slicing_params)
+{
+    const double terminal_z = layer_z(slicing_params, config, path.back()->state.layer_idx);
+    const double base_z = layer_z(slicing_params, config, path[runup_base_idx]->state.layer_idx);
+    const double runup_height = terminal_z - base_z;
+    const coord_t tip_radius = support_element_radius(config, *path.back());
+    const coord_t base_radius = support_element_radius(config, *path[runup_base_idx]);
+    const double major_scale_at_base = std::sqrt(1. + geometry.slope.squaredNorm());
+
+    coord_t radius;
+    double major_scale;
+    if (element_idx == runup_base_idx) {
+        radius = coord_t(std::llround(double(base_radius) * resin_pin_branch_landing_scale));
+        major_scale = major_scale_at_base;
+    } else {
+        const double depth = terminal_z - layer_z(slicing_params, config,
+                                                   path[element_idx]->state.layer_idx);
+        const double transition = runup_height > EPSILON ?
+            std::clamp(depth / runup_height, 0., 1.) : 0.;
+        const double nested_transition = transition *
+            (1. - resin_pin_cone_landing_inset * transition);
+        radius = coord_t(std::llround(double(tip_radius) + nested_transition *
+                                     double(base_radius - tip_radius)));
+        major_scale = 1. + nested_transition * (major_scale_at_base - 1.);
+    }
+
+    return make_terminal_transition_ellipse(
+        radius, major_scale, geometry.slope,
+        Point::new_scale(geometry.centers[element_idx].x(), geometry.centers[element_idx].y()));
+}
+
+static bool direct_terminal_geometry_is_printable(
+    const std::vector<const SupportElement*> &path,
+    const DirectTerminalGeometry &geometry,
+    size_t runup_base_idx,
+    const TreeSupportSettings &config,
+    const SlicingParameters &slicing_params,
+    TreeModelVolumes &volumes)
+{
+    const double maximum_move = unscaled<double>(config.maximum_move_distance);
+    // The selected normal is a hard per-layer limit from the socket through
+    // the conical runup. The lower Hermite segment inherits the already
+    // printable Organic branch's incoming tangent.
+    for (size_t idx = runup_base_idx + 1; idx < path.size(); ++ idx) {
+        const double lower_z = layer_z(slicing_params, config, path[idx - 1]->state.layer_idx);
+        const double upper_z = layer_z(slicing_params, config, path[idx]->state.layer_idx);
+        const double layer_move_limit = maximum_branch_slope(config) * (upper_z - lower_z);
+        if ((geometry.centers[idx] - geometry.centers[idx - 1]).norm() >
+            std::min(maximum_move, layer_move_limit) + EPSILON)
+            return false;
+    }
+
+    std::vector<Polygons> footprints;
+    footprints.reserve(path.size() - runup_base_idx);
+    for (size_t idx = runup_base_idx; idx < path.size(); ++ idx) {
+        Polygons footprint{ direct_terminal_footprint(
+            path, geometry, runup_base_idx, idx, config, slicing_params) };
+        const LayerIndex layer_idx = path[idx]->state.layer_idx;
+        footprint = diff_clipped(footprint, volumes.getCollision(0, layer_idx, true),
+                                 ApplySafetyOffset::Yes);
+        footprint = intersection(footprint, volumes.m_bed_area, ApplySafetyOffset::Yes);
+        remove_small(footprint, tiny_area_threshold());
+        if (footprint.empty() || std::abs(area(footprint)) <= tiny_area_threshold())
+            return false;
+        footprints.emplace_back(std::move(footprint));
+    }
+
+    for (size_t idx = 1; idx < footprints.size(); ++ idx) {
+        const double upper_area = std::abs(area(footprints[idx]));
+        const double supported_area = std::abs(area(intersection_clipped(
+            footprints[idx], footprints[idx - 1], ApplySafetyOffset::Yes)));
+        if (upper_area <= tiny_area_threshold() ||
+            supported_area + tiny_area_threshold() < resin_pin_minimum_layer_support * upper_area)
+            return false;
+    }
+    return true;
+}
+
+static std::optional<DirectTerminalGeometry> select_direct_terminal_geometry(
+    const std::vector<const SupportElement*> &path,
+    size_t runup_base_idx,
+    const TerminalContactFrame &frame,
+    const TreeSupportSettings &config,
+    const SlicingParameters &slicing_params,
+    TreeModelVolumes &volumes)
+{
+    DirectTerminalGeometry vertical = make_direct_terminal_geometry(
+        path, runup_base_idx, frame, 0., config, slicing_params);
+    if (!direct_terminal_geometry_is_printable(
+            path, vertical, runup_base_idx, config, slicing_params, volumes))
+        return std::nullopt;
+    if (frame.axis.head<2>().squaredNorm() <= EPSILON)
+        return vertical;
+
+    DirectTerminalGeometry desired = make_direct_terminal_geometry(
+        path, runup_base_idx, frame, 1., config, slicing_params);
+    if (direct_terminal_geometry_is_printable(
+            path, desired, runup_base_idx, config, slicing_params, volumes))
+        return desired;
+
+    double valid_scale = 0.;
+    double invalid_scale = 1.;
+    DirectTerminalGeometry valid = std::move(vertical);
+    for (size_t iteration = 0; iteration < resin_pin_tilt_bisection_iterations; ++ iteration) {
+        const double candidate_scale = 0.5 * (valid_scale + invalid_scale);
+        DirectTerminalGeometry candidate = make_direct_terminal_geometry(
+            path, runup_base_idx, frame, candidate_scale, config, slicing_params);
+        if (direct_terminal_geometry_is_printable(
+                path, candidate, runup_base_idx, config, slicing_params, volumes)) {
+            valid_scale = candidate_scale;
+            valid = std::move(candidate);
+        } else {
+            invalid_scale = candidate_scale;
+        }
+    }
+    return valid_scale > 0. ? std::optional<DirectTerminalGeometry>(std::move(valid)) : std::nullopt;
+}
+
 // Returns Z span of the generated mesh.
 static std::pair<float, float> extrude_branch(
     const std::vector<const SupportElement*>&path,
@@ -2934,6 +3180,7 @@ static std::pair<float, float> extrude_branch(
     const SlicingParameters                 &slicing_params,
     const std::vector<SupportElements>      &move_bounds,
     bool                                     has_root,
+    const std::vector<double>               *radius_scales,
     indexed_triangle_set                    &result)
 {
     Vec3d p1, p2, p3;
@@ -2941,10 +3188,15 @@ static std::pair<float, float> extrude_branch(
     Vec3d nprev;
     Vec3d ncurrent;
     assert(path.size() >= 2);
+    assert(radius_scales == nullptr || radius_scales->size() == path.size());
     static constexpr const float eps = 0.015f;
     std::pair<int, int> prev_strip;
     float zmin = 0;
     float zmax = 0;
+    auto radius_at = [&path, &config, radius_scales](size_t path_idx) {
+        const double scale = radius_scales == nullptr ? 1. : (*radius_scales)[path_idx];
+        return float(unscaled<double>(support_element_radius(config, *path[path_idx])) * scale);
+    };
 
     for (size_t ipath = 1; ipath < path.size(); ++ ipath) {
         const SupportElement &prev    = *path[ipath - 1];
@@ -2955,7 +3207,7 @@ static std::pair<float, float> extrude_branch(
         v1 = (p2 - p1).normalized();
         if (ipath == 1) {
             nprev = v1;
-            float radius     = unscaled<float>(support_element_radius(config, prev));
+            float radius     = radius_at(ipath - 1);
             if (has_root && prev.state.layer_idx == 0) {
                 // Orca: Buildplate roots need a flat foot. A rounded cap can extend far
                 // below the bed and make the first layer slice cut unrelated trunk geometry.
@@ -2993,7 +3245,7 @@ static std::pair<float, float> extrude_branch(
             // End of the tube.
             ncurrent = v1;
             // Extrude the top half sphere.
-            float radius = unscaled<float>(support_element_radius(config, current));
+            float radius = radius_at(ipath);
             float angle_step = 2. * acos(1. - eps / radius);
             auto  nsteps = int(ceil(M_PI / (2. * angle_step)));
             angle_step = M_PI / (2. * nsteps);
@@ -3017,7 +3269,7 @@ static std::pair<float, float> extrude_branch(
             p3 = to_3d(unscaled<double>(next.state.result_on_layer), layer_z(slicing_params, config, next.state.layer_idx));
             v2 = (p3 - p2).normalized();
             ncurrent = (v1 + v2).normalized();
-            float radius = unscaled<float>(support_element_radius(config, current));
+            float radius = radius_at(ipath);
             std::pair<int, int> strip = discretize_circle(p2.cast<float>(), ncurrent.cast<float>(), radius, eps, result.vertices);
             triangulate_strip(result, prev_strip.first, prev_strip.second, strip.first, strip.second);
             prev_strip = strip;
@@ -3685,6 +3937,143 @@ static void recover_pending_branch_roofs(
     }
 }
 
+static TerminalContactFrames resolve_terminal_contact_frames(
+    const PrintObject                                  &print_object,
+    const std::vector<std::pair<SupportElement *, int>> &elements_with_link_down,
+    const TreeSupportSettings                           &config)
+{
+    TerminalContactFrames frames;
+    if (print_object.config().support_interface_top_layers.value != 0)
+        return frames;
+
+    frames.reserve(elements_with_link_down.size());
+    const size_t num_raft_layers  = config.raft_layers.size();
+    const size_t z_distance_delta = config.z_distance_top_layers + 1;
+    for (const auto &[element, link_down] : elements_with_link_down) {
+        const SupportElementState &state = element->state;
+        if (link_down < 0 || !element->parents.empty() || state.distance_to_top != 0 ||
+            !state.result_on_layer_is_set() || state.deleted || state.target_height < 0)
+            continue;
+
+        const size_t overhang_layer = size_t(state.target_height) + z_distance_delta;
+        if (overhang_layer < num_raft_layers)
+            continue;
+        const size_t object_layer_idx = overhang_layer - num_raft_layers;
+        if (object_layer_idx >= print_object.layer_count())
+            continue;
+
+        const Layer *object_layer = print_object.get_layer(int(object_layer_idx));
+        const double support_tip_z = layer_z(print_object.slicing_parameters(), config,
+                                             size_t(state.layer_idx));
+        const bool direct_contact = print_object.config().tree_support_round_tip.value &&
+                                    print_object.config().support_top_z_distance.value <= EPSILON;
+        frames.emplace(element, TerminalContactFrame{
+            state.result_on_layer,
+            support_tip_z,
+            direct_contact ? support_tip_z : object_layer->bottom_z(),
+            support_element_radius(config, state),
+            object_layer->id(),
+            object_layer_idx,
+            Vec3d::UnitZ(),
+            direct_contact,
+            false
+        });
+    }
+
+    if (frames.empty() ||
+        std::none_of(frames.begin(), frames.end(), [](const auto &entry) { return entry.second.direct_contact; }))
+        return frames;
+
+    // A CSG subtraction may expose a surface whose triangle normal does not
+    // describe the final sliced solid, so keep direct contacts vertical for an
+    // object containing negative volumes.
+    const ModelObject *model_object = print_object.model_object();
+    if (std::any_of(model_object->volumes.begin(), model_object->volumes.end(),
+                    [](const ModelVolume *volume) { return volume->is_negative_volume(); }))
+        return frames;
+
+    TriangleMesh contact_mesh = model_object->raw_mesh();
+    if (contact_mesh.its.indices.empty() || contact_mesh.its.vertices.empty())
+        return frames;
+    contact_mesh.transform(print_object.trafo_centered(), true);
+    if (std::any_of(contact_mesh.its.vertices.begin(), contact_mesh.its.vertices.end(),
+                    [](const Vec3f &vertex) { return !vertex.allFinite(); }))
+        return frames;
+
+    // This object-local acceleration structure is shared by every terminal,
+    // but all raycasts are completed here before parallel branch rendering.
+    const AABBMesh contact_aabb(contact_mesh);
+    static const std::array<Vec2d, 5> sample_directions{
+        Vec2d(0., 0.), Vec2d(1., 0.), Vec2d(-1., 0.), Vec2d(0., 1.), Vec2d(0., -1.)
+    };
+    static constexpr double compatible_normal_cosine = 0.8660254037844386; // 30 degrees.
+
+    for (auto &[terminal, frame] : frames) {
+        if (!frame.direct_contact)
+            continue;
+
+        const Layer *object_layer = print_object.get_layer(int(frame.object_layer_idx));
+        const double sample_radius = 0.5 * unscaled<double>(frame.nominal_radius);
+        const double layer_tolerance = std::max(
+            2. * object_layer->height,
+            unscaled<double>(frame.nominal_radius) * maximum_branch_slope(config) + object_layer->height);
+        const double ray_start_z = frame.support_tip_z - std::max(0.5, 2. * object_layer->height);
+        std::array<Vec3d, sample_directions.size()> normals;
+        size_t num_normals = 0;
+        Vec3d center_normal = Vec3d::Zero();
+        bool center_valid = false;
+
+        for (size_t sample_idx = 0; sample_idx < sample_directions.size(); ++ sample_idx) {
+            // The smoothed terminal may move laterally away from its source
+            // overhang. Raycast around that supported source, whose layer is
+            // what target_height identifies, while retaining the realized
+            // terminal as the rendered contact center.
+            const Vec2d sample_xy = unscaled<double>(terminal->state.target_position) +
+                                    sample_radius * sample_directions[sample_idx];
+            const AABBMesh::hit_result hit = contact_aabb.query_ray_hit(
+                Vec3d(sample_xy.x(), sample_xy.y(), ray_start_z), Vec3d::UnitZ());
+            if (!hit.is_hit() || !hit.position().allFinite() || !hit.normal().allFinite() ||
+                hit.normal().squaredNorm() <= EPSILON || hit.normal().z() >= -EPSILON)
+                continue;
+            if (hit.position().z() < object_layer->bottom_z() - layer_tolerance ||
+                hit.position().z() > object_layer->print_z + layer_tolerance)
+                continue;
+
+            const Vec3d normal = hit.normal().normalized();
+            if (sample_idx == 0) {
+                center_normal = normal;
+                center_valid = true;
+            } else if (!center_valid || normal.dot(center_normal) < compatible_normal_cosine) {
+                continue;
+            }
+            normals[num_normals ++] = normal;
+        }
+
+        // Requiring the center and two neighboring samples avoids steering a
+        // tip from an isolated edge, a degenerate fan, or an unrelated shell.
+        if (!center_valid || num_normals < 3)
+            continue;
+        Vec3d average_normal = Vec3d::Zero();
+        for (size_t normal_idx = 0; normal_idx < num_normals; ++ normal_idx)
+            average_normal += normals[normal_idx];
+        if (!average_normal.allFinite() || average_normal.squaredNorm() <= EPSILON)
+            continue;
+
+        Vec3d axis = -average_normal.normalized();
+        if (!axis.allFinite() || axis.z() <= EPSILON)
+            continue;
+        const double xy_length = axis.head<2>().norm();
+        const double max_slope = maximum_branch_slope(config);
+        if (xy_length / axis.z() > max_slope && xy_length > EPSILON) {
+            const Vec2d xy_direction = axis.head<2>() / xy_length;
+            axis = Vec3d(xy_direction.x() * max_slope, xy_direction.y() * max_slope, 1.).normalized();
+        }
+        frame.axis = axis;
+        frame.surface_normal_resolved = true;
+    }
+    return frames;
+}
+
 // Organic specific: Smooth branches and produce one cumulative mesh to be sliced.
 void organic_draw_branches(
     PrintObject                     &print_object,
@@ -3750,7 +4139,9 @@ void organic_draw_branches(
 
     organic_smooth_branches_avoid_collisions(print_object, volumes, config, move_bounds, elements_with_link_down, linear_data_layers, throw_on_cancel);
 
-    tree_support.store_organic_support_contacts(elements_with_link_down, config);
+    const TerminalContactFrames terminal_frames =
+        resolve_terminal_contact_frames(print_object, elements_with_link_down, config);
+    tree_support.store_organic_support_contacts(terminal_frames);
 
     // Reduce memory footprint. After this point only finalize_interface_and_support_areas() will use volumes and from that only collisions with zero radius will be used.
     volumes.clear_all_but_object_collision();
@@ -3874,16 +4265,94 @@ void organic_draw_branches(
     const bool round_tip = print_object.config().tree_support_round_tip.value;
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
-        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel, round_tip](const tbb::blocked_range<size_t> &range) {
+        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params,
+         &interface_placer, &terminal_frames, &throw_on_cancel, round_tip](const tbb::blocked_range<size_t> &range) {
             indexed_triangle_set    partial_mesh;
             std::vector<float>      slice_z;
             std::vector<Polygons>   bottom_contacts;
             for (size_t tree_id = range.begin(); tree_id < range.end(); ++ tree_id) {
                 Tree &tree = trees[tree_id];
                 for (const Branch &branch : tree.branches) {
+                    const bool resin_tip = round_tip && branch.has_tip;
+                    const size_t runup_base_idx = resin_tip ?
+                        terminal_runup_base_idx(branch.path, config, slicing_params) : branch.path.size();
+                    const auto terminal_frame_it = resin_tip ? terminal_frames.find(branch.path.back()) : terminal_frames.end();
+                    const TerminalContactFrame *terminal_frame = terminal_frame_it == terminal_frames.end() ?
+                        nullptr : &terminal_frame_it->second;
+                    std::optional<DirectTerminalGeometry> direct_geometry;
+                    if (terminal_frame != nullptr && terminal_frame->direct_contact &&
+                        terminal_frame->surface_normal_resolved)
+                        direct_geometry = select_direct_terminal_geometry(
+                            branch.path, runup_base_idx, *terminal_frame, config, slicing_params, volumes);
+
+                    // Aim the Organic tube into the centered cone over a longer, eased approach.
+                    // The original collision-aware path remains untouched below the approach.
+                    // Direct contacts use the selected cubic-Hermite frame; gapped contacts retain
+                    // the established centered vertical transition.
+                    std::vector<SupportElement> adjusted_path_elements;
+                    std::vector<const SupportElement*> adjusted_path;
+                    std::vector<double> adjusted_radius_scales;
+                    const std::vector<const SupportElement*> *mesh_path = &branch.path;
+                    if (resin_tip) {
+                        const double runup_base_z = layer_z(slicing_params, config,
+                            branch.path[runup_base_idx]->state.layer_idx);
+                        const size_t approach_start_idx = direct_geometry ?
+                            direct_geometry->approach_start_idx : terminal_approach_start_idx(
+                                branch.path, runup_base_idx, config, slicing_params);
+
+                        adjusted_path_elements.reserve(branch.path.size());
+                        adjusted_path.reserve(branch.path.size());
+                        adjusted_radius_scales.assign(branch.path.size(), 1.);
+                        for (const SupportElement *element : branch.path)
+                            adjusted_path_elements.emplace_back(element->state, Polygons{});
+
+                        if (direct_geometry) {
+                            for (size_t element_idx = approach_start_idx + 1;
+                                 element_idx < adjusted_path_elements.size(); ++ element_idx) {
+                                adjusted_path_elements[element_idx].state.result_on_layer =
+                                    Point::new_scale(direct_geometry->centers[element_idx]);
+                                adjusted_radius_scales[element_idx] =
+                                    direct_geometry->radius_scales[element_idx];
+                            }
+                        } else {
+                            const Point terminal_center = branch.path.back()->state.result_on_layer;
+                            const Vec2d planned_landing_center = 0.5 *
+                                (branch.path[runup_base_idx - 1]->state.result_on_layer.cast<double>() +
+                                 branch.path[runup_base_idx]->state.result_on_layer.cast<double>());
+                            const Vec2d approach_translation = terminal_center.cast<double>() -
+                                planned_landing_center;
+                            const double approach_start_z = layer_z(slicing_params, config,
+                                branch.path[approach_start_idx]->state.layer_idx);
+                            const double approach_height = runup_base_z - approach_start_z;
+                            for (size_t element_idx = approach_start_idx + 1;
+                                 element_idx < adjusted_path_elements.size(); ++ element_idx) {
+                                double blend = 1.;
+                                if (element_idx < runup_base_idx && approach_height > EPSILON) {
+                                    const double element_z = layer_z(slicing_params, config,
+                                        branch.path[element_idx]->state.layer_idx);
+                                    const double t = std::clamp(
+                                        (element_z - approach_start_z) / approach_height, 0., 1.);
+                                    blend = t * t * t * (t * (6. * t - 15.) + 10.);
+                                }
+                                const Vec2d planned_center =
+                                    branch.path[element_idx]->state.result_on_layer.cast<double>();
+                                const Vec2d center = planned_center + blend * approach_translation;
+                                adjusted_path_elements[element_idx].state.result_on_layer = Point(
+                                    coord_t(std::llround(center.x())), coord_t(std::llround(center.y())));
+                                adjusted_radius_scales[element_idx] =
+                                    1. + blend * (resin_pin_branch_landing_scale - 1.);
+                            }
+                        }
+                        for (SupportElement &element : adjusted_path_elements)
+                            adjusted_path.emplace_back(&element);
+                        mesh_path = &adjusted_path;
+                    }
+
                     // Triangulate the tube.
                     partial_mesh.clear();
-                    std::pair<float, float> zspan = extrude_branch(branch.path, config, slicing_params, move_bounds, branch.has_root, partial_mesh);
+                    std::pair<float, float> zspan = extrude_branch(
+                        *mesh_path, config, slicing_params, move_bounds, branch.has_root,
+                        resin_tip ? &adjusted_radius_scales : nullptr, partial_mesh);
                     LayerIndex layer_begin = branch.has_root ?
                         branch.path.front()->state.layer_idx : 
                         std::min(branch.path.front()->state.layer_idx, layer_idx_ceil(slicing_params, config, zspan.first));
@@ -3903,47 +4372,54 @@ void organic_draw_branches(
                     if (slices.empty())
                         continue;
 
-                    if (round_tip && branch.has_tip) {
-                        // A tube cut by a horizontal layer is elliptical when the branch is
-                        // inclined. Taper the final cuts through progressively smaller,
-                        // branch-aligned ellipses into a round pin at the realized contact.
-                        // Interpolating both the center and eccentricity spreads the transition
-                        // over several layers instead of leaving either an abrupt vertical neck
-                        // or a single cantilevered terminal circle. Collision and bed clipping
-                        // still run afterward.
-                        const Point terminal_center = branch.path.back()->state.result_on_layer;
-                        const Vec2d terminal_center_f = terminal_center.cast<double>();
-                        const size_t num_transition_layers = std::min<size_t>(4, branch.path.size());
-                        for (size_t distance_to_tip = 0; distance_to_tip < num_transition_layers; ++ distance_to_tip) {
+                    if (resin_tip) {
+                        // Taper the upper 0.8 mm through progressively smaller ellipses into a
+                        // circular endpoint. Direct-contact centers follow the selected normal;
+                        // configured-gap tips retain their established concentric runup.
+                        const Point terminal_center = terminal_frame != nullptr ?
+                            terminal_frame->position : branch.path.back()->state.result_on_layer;
+                        const double terminal_z = layer_z(slicing_params, config,
+                            branch.path.back()->state.layer_idx);
+                        const size_t base_idx = runup_base_idx;
+                        const size_t num_transition_layers = branch.path.size() - base_idx;
+                        const double runup_height = terminal_z - layer_z(slicing_params, config,
+                            branch.path[base_idx]->state.layer_idx);
+                        const coord_t tip_radius = support_element_radius(config, *branch.path.back());
+                        const coord_t base_radius = support_element_radius(config, *branch.path[base_idx]);
+                        const Vec2d branch_direction = direct_geometry ? direct_geometry->slope :
+                            (branch.path[base_idx]->state.result_on_layer -
+                             branch.path[base_idx - 1]->state.result_on_layer).cast<double>();
+                        const double z_distance = layer_z(slicing_params, config,
+                            branch.path[base_idx]->state.layer_idx) - layer_z(slicing_params, config,
+                            branch.path[base_idx - 1]->state.layer_idx);
+                        const double xy_distance = unscale<double>(branch_direction.norm());
+                        const double natural_major_scale = direct_geometry ?
+                            std::sqrt(1. + direct_geometry->slope.squaredNorm()) :
+                            (z_distance > EPSILON ?
+                                std::clamp(std::sqrt(1. + sqr(xy_distance / z_distance)), 1., 1.5) : 1.);
+                        for (size_t distance_to_tip = 0;
+                             distance_to_tip + 1 < num_transition_layers; ++ distance_to_tip) {
                             const size_t element_idx = branch.path.size() - 1 - distance_to_tip;
                             const SupportElement &element = *branch.path[element_idx];
                             const LayerIndex transition_layer = element.state.layer_idx;
                             if (transition_layer < layer_begin || transition_layer >= layer_begin + LayerIndex(slices.size()))
                                 continue;
 
-                            const double transition = num_transition_layers <= 1 ? 0. :
-                                double(distance_to_tip) / double(num_transition_layers - 1);
-                            const Vec2d planned_center = element.state.result_on_layer.cast<double>();
-                            const Vec2d center = terminal_center_f +
-                                transition * (planned_center - terminal_center_f);
+                            const double depth = terminal_z - layer_z(slicing_params, config,
+                                element.state.layer_idx);
+                            const double transition = runup_height > EPSILON ? depth / runup_height : 0.;
+                            const double nested_transition = transition *
+                                (1. - resin_pin_cone_landing_inset * transition);
 
-                            const size_t lower_idx = element_idx > 0 ? element_idx - 1 : element_idx;
-                            const size_t upper_idx = std::min(element_idx + 1, branch.path.size() - 1);
-                            const Vec2d branch_direction =
-                                (branch.path[upper_idx]->state.result_on_layer -
-                                 branch.path[lower_idx]->state.result_on_layer).cast<double>();
-                            const double z_distance = layer_z(slicing_params, config,
-                                branch.path[upper_idx]->state.layer_idx) - layer_z(slicing_params, config,
-                                branch.path[lower_idx]->state.layer_idx);
-                            const double xy_distance = unscale<double>(branch_direction.norm());
-                            const double natural_major_scale = z_distance > EPSILON ?
-                                std::clamp(std::sqrt(1. + sqr(xy_distance / z_distance)), 1., 1.5) : 1.;
-                            const double major_scale = 1. + transition * (natural_major_scale - 1.);
-                            const Point ellipse_center(coord_t(std::llround(center.x())),
-                                                       coord_t(std::llround(center.y())));
+                            const double major_scale = 1. + nested_transition * (natural_major_scale - 1.);
+                            const coord_t cone_radius = coord_t(std::llround(
+                                double(tip_radius) + nested_transition *
+                                double(base_radius - tip_radius)));
+                            const Point center = direct_geometry ?
+                                Point::new_scale(direct_geometry->centers[element_idx]) : terminal_center;
                             Polygon ellipse = make_terminal_transition_ellipse(
-                                support_element_radius(config, element), major_scale,
-                                branch_direction, ellipse_center);
+                                cone_radius, major_scale,
+                                branch_direction, center);
                             slices[transition_layer - layer_begin] = Polygons{ std::move(ellipse) };
                         }
                     }

@@ -564,6 +564,9 @@ public:
         row(_u8L("Support tip Z"), format_mm(contact->support_tip_z));
         row(_u8L("Model contact Z"), format_mm(contact->model_contact_z));
         row(_u8L("Nominal clearance"), format_mm(contact->nominal_clearance));
+        if (contact->nominal_clearance <= EPSILON)
+            imgui.text_wrapped(from_u8(_u8L("Zero-clearance Pin contact: same-PLA supports may fuse to or mark the model.")),
+                               ImGui::GetContentRegionAvail().x);
         row(_u8L("Association tolerance"), format_mm(contact->association_tolerance));
 
         for (size_t association_idx = 0; association_idx < contact->associations.size(); ++association_idx) {

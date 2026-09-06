@@ -15673,6 +15673,12 @@ msgstr ""
 msgid "Branch tip diameter for organic supports."
 msgstr ""
 
+msgid "Round branch tips"
+msgstr ""
+
+msgid "Shape the final 0.8 mm of an Organic support branch into a small circular Pin contact and an eased 1.6 mm socket. With zero Top Z distance and no top interface, the Pin axis follows the model's underside surface normal when it can remain printable; configured-gap Pins remain vertical. Zero-clearance contact with the same PLA may fuse to or mark the model."
+msgstr ""
+
 msgid "Tree support branch diameter"
 msgstr ""
 
@@ -19774,6 +19780,9 @@ msgid "Model contact Z"
 msgstr ""
 
 msgid "Nominal clearance"
+msgstr ""
+
+msgid "Zero-clearance Pin contact: same-PLA supports may fuse to or mark the model."
 msgstr ""
 
 msgid "Association tolerance"

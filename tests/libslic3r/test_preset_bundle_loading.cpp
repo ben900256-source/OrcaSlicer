@@ -692,8 +692,8 @@ TEST_CASE("Prusa XL miniature Pin profiles resolve to the mixed-nozzle tool", "[
         CHECK_FALSE(is_compatible_with_printer(profile_with_vendor, bundle.printers.get_preset_with_vendor_profile(*all_025)));
         CHECK_FALSE(is_compatible_with_printer(profile_with_vendor, bundle.printers.get_preset_with_vendor_profile(*all_04)));
     }
-    CHECK_THAT(ultra->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.05, 1e-9));
-    CHECK_THAT(balanced->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.06, 1e-9));
+    CHECK_THAT(ultra->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.0, 1e-9));
+    CHECK_THAT(balanced->config.opt_float("support_top_z_distance"), Catch::Matchers::WithinAbs(0.0, 1e-9));
 
     const ConfigOptionFloats *volumetric_speed = filament->config.option<ConfigOptionFloats>("filament_max_volumetric_speed");
     const ConfigOptionStrings *start_gcode = filament->config.option<ConfigOptionStrings>("filament_start_gcode");
@@ -710,4 +710,3 @@ TEST_CASE("Prusa XL miniature Pin profiles resolve to the mixed-nozzle tool", "[
     CHECK_FALSE(is_compatible_with_printer(bundle.filaments.get_preset_with_vendor_profile(*filament),
                                            bundle.printers.get_preset_with_vendor_profile(*all_04)));
 }
-

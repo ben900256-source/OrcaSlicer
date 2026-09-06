@@ -19,6 +19,8 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include <unordered_map>
+
 
 // #define TREE_SUPPORT_SHOW_ERRORS
 
@@ -298,6 +300,23 @@ struct SupportElement
 };
 
 using SupportElements = std::deque<SupportElement>;
+
+// Transient geometry resolved for a terminal after Organic smoothing. This is
+// intentionally kept out of SupportContact and the serialized slicing state.
+struct TerminalContactFrame
+{
+    Point    position;
+    coordf_t support_tip_z;
+    coordf_t model_contact_z;
+    coord_t  nominal_radius;
+    size_t   object_layer_id;
+    size_t   object_layer_idx;
+    Vec3d    axis{ Vec3d::UnitZ() };
+    bool     direct_contact{ false };
+    bool     surface_normal_resolved{ false };
+};
+
+using TerminalContactFrames = std::unordered_map<const SupportElement *, TerminalContactFrame>;
 
 [[nodiscard]] inline coord_t support_element_radius(const TreeSupportSettings &settings, const SupportElement &elem)
 {

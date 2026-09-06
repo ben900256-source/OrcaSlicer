@@ -298,18 +298,27 @@ double support_path_length(const PrintObject &object)
     return length;
 }
 
-bool round_terminal_layers_form_centered_elliptical_taper(const PrintObject &object)
+bool round_terminal_layers_form_resin_style_runup(const PrintObject &object)
 {
-    static constexpr size_t transition_layers = 4;
+    static constexpr double minimum_runup_height_mm = 0.8;
     const ConstSupportLayerPtrsAdaptor layers = object.support_layers();
     size_t checked = 0;
     size_t tapered_checked = 0;
+    size_t supported_bases_checked = 0;
     for (const SupportContact &contact : object.support_contacts()) {
         size_t layer_idx = 0;
         while (layer_idx < layers.size() && std::abs(layers[layer_idx]->print_z - contact.support_tip_z) >= EPSILON)
             ++ layer_idx;
-        if (layer_idx < transition_layers || layer_idx == layers.size())
+        if (layer_idx == layers.size())
             return false;
+
+        size_t runup_base_depth = 1;
+        while (runup_base_depth < layer_idx &&
+               contact.support_tip_z - layers[layer_idx - runup_base_depth]->print_z <
+                   minimum_runup_height_mm - EPSILON)
+            ++ runup_base_depth;
+        if (runup_base_depth >= layer_idx)
+            continue;
 
         const ExPolygon *upper = nullptr;
         for (const ExPolygon &island : layers[layer_idx]->support_islands)
@@ -330,13 +339,14 @@ bool round_terminal_layers_form_centered_elliptical_taper(const PrintObject &obj
             return false;
         ++ checked;
 
-        bool taper_is_isolated = true;
-        bool has_ellipse = false;
+        bool upper_runup_is_centered = true;
+        size_t isolated_taper_layers = 0;
         double previous_area = std::abs(upper->area());
-        double previous_center_offset = pin_center_offset;
-        // Three progressively larger elliptical slices lead from the centered
-        // pin into the untouched Organic tube on the fourth layer below.
-        for (size_t depth = 1; depth <= transition_layers; ++ depth) {
+        double maximum_isolated_radius = contact.nominal_radius;
+        bool cone_base_is_supported = false;
+        // A long sequence of concentric, progressively larger elliptical slices
+        // leads from the centered pin into one untouched Organic tube layer below.
+        for (size_t depth = 1; depth <= runup_base_depth + 1; ++ depth) {
             const ExPolygon *overlapping = nullptr;
             for (const ExPolygon &island : layers[layer_idx - depth]->support_islands)
                 if (! intersection_ex(ExPolygons{ *upper }, ExPolygons{ island }).empty()) {
@@ -345,7 +355,18 @@ bool round_terminal_layers_form_centered_elliptical_taper(const PrintObject &obj
                 }
             if (overlapping == nullptr)
                 return false;
-            if (depth < transition_layers) {
+            // The lowest runup layer is the natural Organic tube. It must almost
+            // entirely carry the first conical ellipse immediately above it.
+            if (depth == runup_base_depth) {
+                const double cone_base_area = std::abs(upper->area());
+                double supported_area = 0.;
+                for (const ExPolygon &overlap :
+                     intersection_ex(ExPolygons{ *upper }, ExPolygons{ *overlapping }))
+                    supported_area += std::abs(overlap.area());
+                const double support_ratio = cone_base_area > 0. ? supported_area / cone_base_area : 0.;
+                cone_base_is_supported = support_ratio >= 0.98;
+            }
+            if (depth <= runup_base_depth) {
                 const size_t contacts_in_island = std::count_if(
                     object.support_contacts().begin(), object.support_contacts().end(),
                     [&](const SupportContact &candidate) {
@@ -354,27 +375,136 @@ bool round_terminal_layers_form_centered_elliptical_taper(const PrintObject &obj
                     });
                 const MinAreaBoundigBox box(*overlapping);
                 const double short_side = double(std::min(box.width(), box.height()));
-                const double long_side  = double(std::max(box.width(), box.height()));
                 if (contacts_in_island == 1 && short_side > 0.) {
                     const double center_offset = unscale<double>(
                         (overlapping->contour.centroid() - contact.position).cast<double>().norm());
-                    const double slice_area = std::abs(overlapping->area());
-                    if (center_offset + 0.01 < previous_center_offset ||
-                        slice_area < 0.95 * previous_area)
-                        return false;
-                    has_ellipse |= long_side / short_side > 1.015;
-                    previous_center_offset = center_offset;
-                    previous_area = slice_area;
-                } else {
-                    taper_is_isolated = false;
+                    if (depth <= 4 && center_offset > 0.03)
+                        upper_runup_is_centered = false;
+                    if (center_offset <= 0.03) {
+                        const double slice_area = std::abs(overlapping->area());
+                        if (slice_area < 0.95 * previous_area)
+                            return false;
+                        ++ isolated_taper_layers;
+                        previous_area = slice_area;
+                        maximum_isolated_radius = std::max(maximum_isolated_radius,
+                            std::sqrt(slice_area / PI));
+                    }
                 }
             }
             upper = overlapping;
         }
-        if (taper_is_isolated && has_ellipse)
+        const double runup_height = contact.support_tip_z -
+            layers[layer_idx - runup_base_depth]->print_z;
+        if (upper_runup_is_centered && runup_height >= minimum_runup_height_mm - EPSILON &&
+            runup_base_depth >= 10 && isolated_taper_layers >= 4 &&
+            maximum_isolated_radius >= 1.5 * contact.nominal_radius)
             ++ tapered_checked;
+        if (cone_base_is_supported)
+            ++ supported_bases_checked;
     }
-    return checked >= 6 && tapered_checked >= 6;
+    return checked >= 6 && tapered_checked >= 6 && supported_bases_checked >= 6;
+}
+
+struct TerminalRunupStats {
+    size_t count{ 0 };
+    double median_angle_degrees{ 0. };
+    double max_angle_degrees{ 0. };
+    double median_x_slope{ 0. };
+    double minimum_support_ratio{ 1. };
+};
+
+TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample_depth_mm = 0.4)
+{
+    std::vector<double> angles;
+    std::vector<double> x_slopes;
+    double minimum_support_ratio = 1.;
+    const ConstSupportLayerPtrsAdaptor layers = object.support_layers();
+    for (const SupportContact &contact : object.support_contacts()) {
+        size_t terminal_layer_idx = 0;
+        while (terminal_layer_idx < layers.size() &&
+               std::abs(layers[terminal_layer_idx]->print_z - contact.support_tip_z) >= EPSILON)
+            ++ terminal_layer_idx;
+        if (terminal_layer_idx == layers.size())
+            continue;
+
+        const ExPolygon *upper = nullptr;
+        for (const ExPolygon &island : layers[terminal_layer_idx]->support_islands)
+            if (island.contains(contact.position)) {
+                const double nominal_area = PI * sqr(double(contact.nominal_radius));
+                const double area_ratio = std::abs(island.area()) / nominal_area;
+                if (area_ratio >= 0.9 && area_ratio <= 1.1)
+                    upper = &island;
+                break;
+            }
+        if (upper == nullptr)
+            continue;
+
+        const Point terminal_center = upper->contour.centroid();
+        const ExPolygon *sample = upper;
+        double sampled_depth = 0.;
+        for (size_t depth = 1; depth <= terminal_layer_idx; ++ depth) {
+            const SupportLayer *lower_layer = layers[terminal_layer_idx - depth];
+            const ExPolygon *lower = nullptr;
+            double largest_overlap_area = 0.;
+            for (const ExPolygon &island : lower_layer->support_islands) {
+                double overlap_area = 0.;
+                for (const ExPolygon &overlap : intersection_ex(ExPolygons{ *sample }, ExPolygons{ island }))
+                    overlap_area += std::abs(overlap.area());
+                if (overlap_area > largest_overlap_area) {
+                    largest_overlap_area = overlap_area;
+                    lower = &island;
+                }
+            }
+            if (lower == nullptr)
+                break;
+            const double upper_area = std::abs(sample->area());
+            if (upper_area > 0.)
+                minimum_support_ratio = std::min(minimum_support_ratio, largest_overlap_area / upper_area);
+            sample = lower;
+            sampled_depth = contact.support_tip_z - lower_layer->print_z;
+            if (sampled_depth + EPSILON >= sample_depth_mm)
+                break;
+        }
+        if (sampled_depth + EPSILON < sample_depth_mm)
+            continue;
+
+        const Point upward_delta_scaled = terminal_center - sample->contour.centroid();
+        const Vec2d upward_delta = unscaled<double>(upward_delta_scaled);
+        const Vec2d slope = upward_delta / sampled_depth;
+        angles.push_back(std::atan(slope.norm()) * 180. / PI);
+        x_slopes.push_back(slope.x());
+    }
+
+    if (angles.empty())
+        return {};
+    std::sort(angles.begin(), angles.end());
+    std::sort(x_slopes.begin(), x_slopes.end());
+    const auto median = [](const std::vector<double> &values) {
+        const size_t middle = values.size() / 2;
+        return values.size() % 2 == 0 ? 0.5 * (values[middle - 1] + values[middle]) : values[middle];
+    };
+    return { angles.size(), median(angles), angles.back(), median(x_slopes), minimum_support_ratio };
+}
+
+TriangleMesh sloped_underside_coupon(double angle_degrees, bool invert_underside = false)
+{
+    TriangleMesh stem = make_cube(2., 2., 15.);
+    stem.translate(Vec3f(-1.f, -1.f, 0.f));
+    TriangleMesh roof = make_cube(12., 12., 1.);
+    roof.translate(Vec3f(-6.f, -6.f, -0.5f));
+    if (invert_underside) {
+        for (Vec3i32 &face : roof.its.indices) {
+            const Vec3f &v0 = roof.its.vertices[size_t(face[0])];
+            const Vec3f &v1 = roof.its.vertices[size_t(face[1])];
+            const Vec3f &v2 = roof.its.vertices[size_t(face[2])];
+            if ((v1 - v0).cross(v2 - v0).z() < -0.9f)
+                std::swap(face[0], face[1]);
+        }
+    }
+    roof.rotate_y(float(angle_degrees * PI / 180.));
+    roof.translate(Vec3f(0.f, 0.f, 15.f));
+    stem.merge(roof);
+    return stem;
 }
 
 } // namespace
@@ -521,7 +651,7 @@ TEST_CASE("Organic supports expose deterministic realized contacts", "[SupportMa
     CHECK(contact_signatures(*second.objects().front()) == first_contacts);
 }
 
-TEST_CASE("Organic contact snapshots exclude unrealized branch endpoints", "[SupportMaterial][OrganicContacts]")
+TEST_CASE("Organic contact snapshots store resolved branch terminals", "[SupportMaterial][OrganicContacts]")
 {
     DynamicPrintConfig config = organic_contact_config();
     config.set_deserialize_strict({ { "tree_support_round_tip", true } });
@@ -557,14 +687,23 @@ TEST_CASE("Organic contact snapshots exclude unrealized branch endpoints", "[Sup
     elements.emplace_back(endpoint, Polygons{}); // not a terminal node
     elements.back().parents.push_back(0);
 
-    std::vector<std::pair<TreeSupport3D::SupportElement*, int>> endpoints = {
-        { &elements[0], 0 },
-        { &elements[1], -1 },
-        { &elements[2], 0 },
-        { &elements[3], 0 },
-    };
+    const size_t object_layer_idx = size_t(target_height) + tree_settings.z_distance_top_layers + 1 -
+                                    tree_settings.raft_layers.size();
+    const Layer *object_layer = object.get_layer(int(object_layer_idx));
+    TreeSupport3D::TerminalContactFrames terminal_frames;
+    terminal_frames.emplace(&elements[0], TreeSupport3D::TerminalContactFrame{
+        endpoint.target_position,
+        TreeSupport3D::layer_z(object.slicing_parameters(), tree_settings, size_t(target_height)),
+        object_layer->bottom_z(),
+        TreeSupport3D::support_element_radius(tree_settings, endpoint),
+        object_layer->id(),
+        object_layer_idx,
+        Vec3d::UnitZ(),
+        false,
+        false
+    });
     TreeSupport snapshotter(object, object.slicing_parameters());
-    snapshotter.store_organic_support_contacts(endpoints, tree_settings);
+    snapshotter.store_organic_support_contacts(terminal_frames);
 
     REQUIRE(object.support_contacts().size() == 1);
     CHECK(object.support_contacts().front().position == endpoint.target_position);
@@ -864,7 +1003,7 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
         TerminalFootprintStats footprints;
         double                 support_volume;
         double                 support_path_length;
-        bool                   terminal_layers_form_centered_elliptical_taper;
+        bool                   terminal_layers_form_resin_style_runup;
     };
     CHECK_FALSE(DynamicPrintConfig::full_print_config().opt_bool("tree_support_round_tip"));
 
@@ -888,22 +1027,22 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
         const TerminalFootprintStats footprints = unobstructed_terminal_footprint_stats(object);
         const double volume = support_volume(object);
         return SliceResult{ footprints, volume, support_path_length(object),
-                            round_terminal_layers_form_centered_elliptical_taper(object) };
+                            round_terminal_layers_form_resin_style_runup(object) };
     };
 
-    for (const auto &[layer_height, top_gap] : std::array<std::pair<double, double>, 2>{
-             std::pair{ 0.05, 0.05 }, std::pair{ 0.06, 0.06 } }) {
-        DYNAMIC_SECTION("layer height " << layer_height) {
+    for (const auto &[layer_height, top_gap] : std::array<std::pair<double, double>, 3>{
+             std::pair{ 0.05, 0.0 }, std::pair{ 0.05, 0.05 }, std::pair{ 0.06, 0.06 } }) {
+        DYNAMIC_SECTION("layer height " << layer_height << ", top gap " << top_gap) {
             const SliceResult baseline  = slice_coupon(layer_height, top_gap, false);
             const SliceResult candidate = slice_coupon(layer_height, top_gap, true);
             CAPTURE(baseline.footprints.count, baseline.footprints.median_aspect_ratio,
                     baseline.footprints.max_aspect_ratio, baseline.support_volume, baseline.support_path_length,
                     candidate.footprints.count, candidate.footprints.median_aspect_ratio,
                     candidate.footprints.max_aspect_ratio, candidate.support_volume, candidate.support_path_length,
-                    candidate.terminal_layers_form_centered_elliptical_taper);
+                    candidate.terminal_layers_form_resin_style_runup);
 
             REQUIRE(candidate.footprints.count >= 6);
-            CHECK(candidate.terminal_layers_form_centered_elliptical_taper);
+            CHECK(candidate.terminal_layers_form_resin_style_runup);
             CHECK(candidate.footprints.median_aspect_ratio <= 1.05);
             CHECK(candidate.footprints.max_aspect_ratio <= 1.10);
             CHECK(candidate.support_volume <= 1.15 * baseline.support_volume);
@@ -912,6 +1051,131 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
             CHECK(candidate.support_path_length <= 1.15 * baseline.support_path_length);
         }
     }
+}
+
+TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    const auto [underside_angle, maximum_tip_angle] = GENERATE(table<double, double>({
+        { 0., 30. }, { 20., 30. }, { 55., 10. }
+    }));
+    CAPTURE(underside_angle, maximum_tip_angle);
+
+    DynamicPrintConfig config = organic_contact_config(4., 10.);
+    config.set_deserialize_strict({
+        { "layer_height",                      0.05 },
+        { "initial_layer_print_height",        0.05 },
+        { "support_top_z_distance",            0.0 },
+        { "tree_support_branch_angle_organic", maximum_tip_angle },
+        { "tree_support_round_tip",            true },
+    });
+
+    Print print;
+    Model model;
+    init_print({ sloped_underside_coupon(underside_angle) }, print, model, config);
+    print.process();
+
+    const PrintObject &object = *print.objects().front();
+    REQUIRE_FALSE(object.support_contacts().empty());
+    for (const SupportContact &contact : object.support_contacts())
+        CHECK_THAT(contact.model_contact_z, Catch::Matchers::WithinAbs(contact.support_tip_z, 1e-6));
+    const TerminalFootprintStats footprints = unobstructed_terminal_footprint_stats(object);
+    if (footprints.count > 0)
+        CHECK(footprints.max_aspect_ratio <= 1.10);
+
+    const TerminalRunupStats runup = terminal_runup_stats(object);
+    CAPTURE(runup.count, runup.median_angle_degrees, runup.max_angle_degrees,
+            runup.median_x_slope, runup.minimum_support_ratio);
+    REQUIRE(runup.count >= 1);
+    CHECK(runup.minimum_support_ratio >= 0.98);
+    if (underside_angle < EPSILON) {
+        CHECK(runup.median_angle_degrees <= 1.0);
+    } else if (underside_angle < maximum_tip_angle) {
+        CHECK_THAT(runup.max_angle_degrees,
+                   Catch::Matchers::WithinAbs(underside_angle, 2.0));
+        CHECK(runup.median_x_slope > 0.);
+    } else {
+        CHECK(runup.max_angle_degrees <= maximum_tip_angle + 1.0);
+        CHECK(runup.median_x_slope > 0.);
+    }
+}
+
+TEST_CASE("Direct Organic Pin tips fall back vertically for negative-volume objects", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    DynamicPrintConfig config = organic_contact_config(4., 10.);
+    config.set_deserialize_strict({
+        { "layer_height",                      0.05 },
+        { "initial_layer_print_height",        0.05 },
+        { "support_top_z_distance",            0.0 },
+        { "tree_support_branch_angle_organic", 10.0 },
+        { "tree_support_round_tip",            true },
+    });
+
+    auto prepare = [&config](Print &print, Model &model) {
+        init_print({ sloped_underside_coupon(55.) }, print, model, config);
+        TriangleMesh negative = make_cube(0.5, 0.5, 0.5);
+        negative.translate(Vec3f(-0.25f, -0.25f, 2.f));
+        model.objects.front()->add_volume(std::move(negative), ModelVolumeType::NEGATIVE_VOLUME);
+        print.apply(model, config);
+        print.validate();
+        print.set_status_silent();
+        print.process();
+    };
+
+    Print first;
+    Model first_model;
+    prepare(first, first_model);
+    const PrintObject &first_object = *first.objects().front();
+    const TerminalRunupStats first_runup = terminal_runup_stats(first_object);
+    CAPTURE(first_runup.count, first_runup.median_angle_degrees,
+            first_runup.max_angle_degrees, first_runup.minimum_support_ratio);
+    REQUIRE(first_runup.count >= 1);
+    CHECK(first_runup.median_angle_degrees <= 1.0);
+    CHECK(first_runup.minimum_support_ratio >= 0.98);
+
+    Print second;
+    Model second_model;
+    prepare(second, second_model);
+    CHECK(contact_signatures(*second.objects().front()) == contact_signatures(first_object));
+    const TerminalRunupStats second_runup = terminal_runup_stats(*second.objects().front());
+    CHECK_THAT(second_runup.median_angle_degrees,
+               Catch::Matchers::WithinAbs(first_runup.median_angle_degrees, 1e-6));
+}
+
+TEST_CASE("Direct Organic Pin tips fall back vertically for invalid surface hits", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    DynamicPrintConfig config = organic_contact_config(4., 10.);
+    config.set_deserialize_strict({
+        { "layer_height",                      0.05 },
+        { "initial_layer_print_height",        0.05 },
+        { "support_top_z_distance",            0.0 },
+        { "tree_support_branch_angle_organic", 30.0 },
+        { "tree_support_round_tip",            true },
+    });
+
+    struct Result {
+        std::vector<ContactSignature> contacts;
+        TerminalRunupStats            runup;
+    };
+    const auto slice_invalid_surface = [&config]() {
+        Print print;
+        Model model;
+        init_print({ sloped_underside_coupon(20., true) }, print, model, config);
+        print.process();
+        const PrintObject &object = *print.objects().front();
+        return Result{ contact_signatures(object), terminal_runup_stats(object) };
+    };
+
+    const Result first = slice_invalid_surface();
+    CAPTURE(first.runup.count, first.runup.median_angle_degrees,
+            first.runup.max_angle_degrees, first.runup.minimum_support_ratio);
+    REQUIRE(first.runup.count >= 1);
+    CHECK(first.runup.median_angle_degrees <= 1.0);
+    CHECK(first.runup.minimum_support_ratio >= 0.98);
+
+    const Result second = slice_invalid_surface();
+    CHECK(second.contacts == first.contacts);
+    CHECK_THAT(second.runup.median_angle_degrees,
+               Catch::Matchers::WithinAbs(first.runup.median_angle_degrees, 1e-6));
 }
 
 TEST_CASE("Organic Pin contact Z matches one two and three layer gaps", "[SupportMaterial][OrganicContacts][MiniaturePin]")
@@ -943,7 +1207,7 @@ TEST_CASE("Organic Pin contact Z matches one two and three layer gaps", "[Suppor
                    Catch::Matchers::WithinAbs(top_gap, 1e-6));
 }
 
-TEST_CASE("Prusa XL miniature profiles realize one-layer Pin contacts on physical tool 2", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+TEST_CASE("Prusa XL miniature profiles realize direct Pin contacts on physical tool 2", "[SupportMaterial][OrganicContacts][MiniaturePin]")
 {
     static constexpr const char *machine_name = "Prusa XL 5T T2 0.25 nozzle (others 0.4)";
     static constexpr const char *filament_name = "Prusa Generic Miniature PLA @XL 5T";
@@ -983,9 +1247,8 @@ TEST_CASE("Prusa XL miniature profiles realize one-layer Pin contacts on physica
             CHECK(config.opt_bool("tree_support_round_tip"));
             CHECK_THAT(config.opt_float("tree_support_angle_slow"),
                        Catch::Matchers::WithinAbs(25.0, 1e-9));
-            const double layer_height = config.opt_float("layer_height");
             CHECK_THAT(config.opt_float("support_top_z_distance"),
-                       Catch::Matchers::WithinAbs(layer_height, 1e-9));
+                       Catch::Matchers::WithinAbs(0.0, 1e-9));
 
             TriangleMesh coupon = load_model("support_contact_coupon.obj");
             coupon.scale(Vec3f(1.f, 1.f, 0.25f));
@@ -998,7 +1261,7 @@ TEST_CASE("Prusa XL miniature profiles realize one-layer Pin contacts on physica
             REQUIRE(object.support_contacts().size() > 1);
             for (const SupportContact &contact : object.support_contacts())
                 CHECK_THAT(contact.model_contact_z - contact.support_tip_z,
-                           Catch::Matchers::WithinAbs(layer_height, 1e-6));
+                           Catch::Matchers::WithinAbs(0.0, 1e-6));
             const std::vector<ContactSignature> signatures = contact_signatures(object);
             CHECK(std::is_sorted(signatures.begin(), signatures.end()));
             CHECK_THAT(median_nearest_neighbour_distance(object.support_contacts()),

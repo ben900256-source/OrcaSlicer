@@ -38,7 +38,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$requiredBundleVersion = '02.04.00.07'
+$requiredBundleVersion = '02.04.00.08'
 $machineName = 'Prusa XL 5T T2 0.25 nozzle (others 0.4)'
 $filamentName = 'Prusa Generic Miniature PLA @XL 5T'
 $processNames = @{

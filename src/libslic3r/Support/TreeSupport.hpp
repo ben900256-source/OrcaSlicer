@@ -376,9 +376,7 @@ public:
 
     // Snapshot final Organic tips after collision-aware smoothing and pruning,
     // before the transient SupportElement graph is discarded.
-    void store_organic_support_contacts(
-        const std::vector<std::pair<TreeSupport3D::SupportElement*, int>> &elements_with_link_down,
-        const TreeSupport3D::TreeSupportSettings                          &config);
+    void store_organic_support_contacts(const TreeSupport3D::TerminalContactFrames &terminal_frames);
 
     void detect_overhangs(bool check_support_necessity = false);
 
