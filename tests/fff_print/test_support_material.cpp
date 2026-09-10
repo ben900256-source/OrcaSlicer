@@ -413,11 +413,19 @@ struct TerminalRunupStats {
     double minimum_support_ratio{ 1. };
 };
 
-TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample_depth_mm = 0.4)
+struct TerminalRunupSample {
+    Vec2d  contact_center;
+    Vec2d  slope;
+    double angle_degrees;
+    double minimum_support_ratio;
+};
+
+std::vector<TerminalRunupSample> terminal_runup_samples(
+    const PrintObject &object, double sample_depth_mm = 0.4,
+    double *overall_minimum_support_ratio = nullptr)
 {
-    std::vector<double> angles;
-    std::vector<double> x_slopes;
-    double minimum_support_ratio = 1.;
+    std::vector<TerminalRunupSample> samples;
+    double overall_minimum = 1.;
     const ConstSupportLayerPtrsAdaptor layers = object.support_layers();
     for (const SupportContact &contact : object.support_contacts()) {
         size_t terminal_layer_idx = 0;
@@ -442,6 +450,7 @@ TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample
         const Point terminal_center = upper->contour.centroid();
         const ExPolygon *sample = upper;
         double sampled_depth = 0.;
+        double minimum_support_ratio = 1.;
         for (size_t depth = 1; depth <= terminal_layer_idx; ++ depth) {
             const SupportLayer *lower_layer = layers[terminal_layer_idx - depth];
             const ExPolygon *lower = nullptr;
@@ -458,8 +467,11 @@ TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample
             if (lower == nullptr)
                 break;
             const double upper_area = std::abs(sample->area());
-            if (upper_area > 0.)
-                minimum_support_ratio = std::min(minimum_support_ratio, largest_overlap_area / upper_area);
+            if (upper_area > 0.) {
+                const double support_ratio = largest_overlap_area / upper_area;
+                minimum_support_ratio = std::min(minimum_support_ratio, support_ratio);
+                overall_minimum = std::min(overall_minimum, support_ratio);
+            }
             sample = lower;
             sampled_depth = contact.support_tip_z - lower_layer->print_z;
             if (sampled_depth + EPSILON >= sample_depth_mm)
@@ -471,12 +483,30 @@ TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample
         const Point upward_delta_scaled = terminal_center - sample->contour.centroid();
         const Vec2d upward_delta = unscaled<double>(upward_delta_scaled);
         const Vec2d slope = upward_delta / sampled_depth;
-        angles.push_back(std::atan(slope.norm()) * 180. / PI);
-        x_slopes.push_back(slope.x());
+        samples.push_back({ unscaled<double>(contact.position), slope,
+                            std::atan(slope.norm()) * 180. / PI,
+                            minimum_support_ratio });
     }
+    if (overall_minimum_support_ratio != nullptr)
+        *overall_minimum_support_ratio = overall_minimum;
+    return samples;
+}
 
-    if (angles.empty())
+TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample_depth_mm = 0.4)
+{
+    double minimum_support_ratio = 1.;
+    const std::vector<TerminalRunupSample> samples =
+        terminal_runup_samples(object, sample_depth_mm, &minimum_support_ratio);
+    if (samples.empty())
         return {};
+    std::vector<double> angles;
+    std::vector<double> x_slopes;
+    angles.reserve(samples.size());
+    x_slopes.reserve(samples.size());
+    for (const TerminalRunupSample &sample : samples) {
+        angles.push_back(sample.angle_degrees);
+        x_slopes.push_back(sample.slope.x());
+    }
     std::sort(angles.begin(), angles.end());
     std::sort(x_slopes.begin(), x_slopes.end());
     const auto median = [](const std::vector<double> &values) {
@@ -484,6 +514,53 @@ TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample
         return values.size() % 2 == 0 ? 0.5 * (values[middle - 1] + values[middle]) : values[middle];
     };
     return { angles.size(), median(angles), angles.back(), median(x_slopes), minimum_support_ratio };
+}
+
+struct NormalTestPanel {
+    Vec2d  center;
+    double x_rotation_degrees;
+    double y_rotation_degrees;
+
+    Vec2d expected_slope() const
+    {
+        return Vec2d(std::tan(y_rotation_degrees * PI / 180.),
+                     -std::tan(x_rotation_degrees * PI / 180.));
+    }
+};
+
+const std::array<NormalTestPanel, 5> &multi_normal_test_panels()
+{
+    static const std::array<NormalTestPanel, 5> panels{
+        NormalTestPanel{ Vec2d(  0.,   0.),   0.,   0. },
+        NormalTestPanel{ Vec2d( 28.,   0.),   0.,  20. },
+        NormalTestPanel{ Vec2d(-28.,   0.),   0., -20. },
+        NormalTestPanel{ Vec2d(  0.,  28.),  18.,   0. },
+        NormalTestPanel{ Vec2d(  0., -28.), -18.,   0. },
+    };
+    return panels;
+}
+
+static constexpr double multi_normal_panel_size_mm = 18.;
+
+TriangleMesh multi_normal_underside_coupon()
+{
+    TriangleMesh coupon;
+    for (const NormalTestPanel &panel : multi_normal_test_panels()) {
+        TriangleMesh stem = make_cube(2., 2., 12.);
+        stem.translate(Vec3f(float(panel.center.x() - 1.),
+                             float(panel.center.y() - 1.), 0.f));
+        coupon.merge(stem);
+
+        TriangleMesh roof = make_cube(
+            multi_normal_panel_size_mm, multi_normal_panel_size_mm, 1.);
+        const float half_panel_size = float(0.5 * multi_normal_panel_size_mm);
+        roof.translate(Vec3f(-half_panel_size, -half_panel_size, -0.5f));
+        roof.rotate_x(float(panel.x_rotation_degrees * PI / 180.));
+        roof.rotate_y(float(panel.y_rotation_degrees * PI / 180.));
+        roof.translate(Vec3f(float(panel.center.x()), float(panel.center.y()), 15.f));
+        coupon.merge(roof);
+    }
+    return coupon;
 }
 
 TriangleMesh sloped_underside_coupon(double angle_degrees, bool invert_underside = false)
@@ -1096,6 +1173,103 @@ TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[Suppor
     } else {
         CHECK(runup.max_angle_degrees <= maximum_tip_angle + 1.0);
         CHECK(runup.median_x_slope > 0.);
+    }
+}
+
+TEST_CASE("Direct Organic Pin tips follow underside normals in multiple directions", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    DynamicPrintConfig config = organic_contact_config(3., 13.33);
+    config.set_deserialize_strict({
+        { "layer_height",                      0.05 },
+        { "initial_layer_print_height",        0.05 },
+        { "support_top_z_distance",            0.0 },
+        { "tree_support_branch_angle_organic", 30.0 },
+        { "tree_support_round_tip",            true },
+    });
+
+    Print print;
+    Model model;
+    init_print({ multi_normal_underside_coupon() }, print, model, config);
+    // Keep the complete cross-shaped fixture inside the finite default bed.
+    ModelInstance *instance = model.objects.front()->instances.front();
+    instance->set_offset(instance->get_offset() + Vec3d(100., 100., 0.));
+    print.apply(model, config);
+    print.validate();
+    print.set_status_silent();
+    print.process();
+
+    const PrintObject &object = *print.objects().front();
+    const std::vector<TerminalRunupSample> samples = terminal_runup_samples(object);
+    CAPTURE(samples.size(), object.support_contacts().size());
+    REQUIRE_FALSE(samples.empty());
+    REQUIRE(samples.size() == object.support_contacts().size());
+    const auto &panels = multi_normal_test_panels();
+    const Transform3d object_transform = object.trafo_centered();
+    const double maximum_panel_distance =
+        std::sqrt(0.5 * sqr(multi_normal_panel_size_mm)) + 0.1;
+    std::vector<Vec2d> transformed_panel_centers;
+    transformed_panel_centers.reserve(panels.size());
+    for (const NormalTestPanel &panel : panels)
+        transformed_panel_centers.emplace_back(
+            (object_transform * Vec3d(panel.center.x(), panel.center.y(), 15.)).head<2>());
+    std::vector<std::vector<TerminalRunupSample>> panel_samples(panels.size());
+    for (const TerminalRunupSample &sample : samples) {
+        size_t nearest_panel = 0;
+        double nearest_distance = std::numeric_limits<double>::max();
+        for (size_t panel_idx = 0; panel_idx < panels.size(); ++ panel_idx) {
+            const double distance =
+                (sample.contact_center - transformed_panel_centers[panel_idx]).norm();
+            if (distance < nearest_distance) {
+                nearest_panel = panel_idx;
+                nearest_distance = distance;
+            }
+        }
+        CAPTURE(sample.contact_center.x(), sample.contact_center.y(), nearest_panel, nearest_distance);
+        CHECK(nearest_distance <= maximum_panel_distance);
+        panel_samples[nearest_panel].push_back(sample);
+    }
+
+    for (size_t panel_idx = 0; panel_idx < panels.size(); ++ panel_idx) {
+        const NormalTestPanel &panel = panels[panel_idx];
+        const std::vector<TerminalRunupSample> &region = panel_samples[panel_idx];
+        CAPTURE(panel_idx, panel.center.x(), panel.center.y(),
+                panel.x_rotation_degrees, panel.y_rotation_degrees, region.size());
+        REQUIRE_FALSE(region.empty());
+        for (const TerminalRunupSample &sample : region)
+            CHECK(sample.minimum_support_ratio >= 0.98);
+
+        const Vec2d model_slope = panel.expected_slope();
+        const Vec3d transformed_axis = object_transform.linear() *
+            Vec3d(model_slope.x(), model_slope.y(), 1.).normalized();
+        const Vec2d expected_slope = transformed_axis.head<2>() / transformed_axis.z();
+        if (expected_slope.squaredNorm() <= EPSILON) {
+            for (const TerminalRunupSample &sample : region) {
+                CAPTURE(sample.contact_center.x(), sample.contact_center.y(),
+                        sample.slope.x(), sample.slope.y(), sample.angle_degrees);
+                CHECK(sample.angle_degrees <= 1.0);
+            }
+            continue;
+        }
+
+        const Vec2d expected_direction = expected_slope.normalized();
+        // Contacts close to a rotated roof edge may intentionally resolve to a side-face
+        // normal. Select the sample aligned with the broad underside to test this panel.
+        const auto most_aligned = std::max_element(
+            region.begin(), region.end(),
+            [&expected_direction](const TerminalRunupSample &lhs, const TerminalRunupSample &rhs) {
+                return lhs.slope.dot(expected_direction) < rhs.slope.dot(expected_direction);
+            });
+        const double expected_angle = std::atan(expected_slope.norm()) * 180. / PI;
+        const double projected_slope = most_aligned->slope.dot(expected_direction);
+        const double projected_angle = std::atan(std::max(0., projected_slope)) * 180. / PI;
+        const double direction_cosine = most_aligned->slope.squaredNorm() > EPSILON ?
+            most_aligned->slope.normalized().dot(expected_direction) : 0.;
+        CAPTURE(most_aligned->contact_center.x(), most_aligned->contact_center.y(),
+                expected_slope.x(), expected_slope.y(), most_aligned->slope.x(), most_aligned->slope.y(),
+                expected_angle, projected_angle, direction_cosine);
+        CHECK(projected_slope > 0.);
+        CHECK_THAT(projected_angle, Catch::Matchers::WithinAbs(expected_angle, 2.0));
+        CHECK(direction_cosine >= 0.98);
     }
 }
 
