@@ -1820,7 +1820,21 @@ void generate_support_toolpaths(
                     SupportParameters support_params2 = support_params;
                     if (support_layer.print_z > 100.0)
                         support_params2.tree_branch_diameter_double_wall_area_scaled = 0.1;
-                    tree_supports_generate_paths(base_layer.extrusions, base_layer.polygons_to_extrude(), flow, support_params2);
+                    if (config.tree_support_round_tip.value) {
+                        // A Pin as wide as the configured line has no room for
+                        // an inset perimeter. Keep its footprint and use a
+                        // narrower line instead of silently losing the tip.
+                        const float pin_width = std::max(flow.height(), std::min(0.75f * flow.width(), 0.8f * flow.nozzle_diameter()));
+                        for (const ExPolygon &island : union_ex(base_layer.polygons_to_extrude())) {
+                            const Polygons polygons = to_polygons(island);
+                            const size_t before = base_layer.extrusions.size();
+                            tree_supports_generate_paths(base_layer.extrusions, polygons, flow, support_params2);
+                            if (base_layer.extrusions.size() == before && pin_width < flow.width())
+                                tree_supports_generate_paths(base_layer.extrusions, polygons, flow.with_width(pin_width), support_params2);
+                        }
+                    } else {
+                        tree_supports_generate_paths(base_layer.extrusions, base_layer.polygons_to_extrude(), flow, support_params2);
+                    }
                     done = true;
                 }
                 if (! done)

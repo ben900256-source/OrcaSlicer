@@ -5,6 +5,7 @@
 #include "libslic3r/MinAreaBoundingBox.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/Support/TreeSupport.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 #include "nlohmann/json.hpp"
@@ -31,6 +32,10 @@ namespace {
 DynamicPrintConfig organic_contact_config(double spacing = 2., double density = 20.)
 {
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    // init_print arranges these fixtures around the origin. Keep the complete
+    // model and its Organic roots inside the finite bed used for clipping.
+    config.set_key_value("printable_area", new ConfigOptionPoints{
+        Vec2d(-200., -200.), Vec2d(200., -200.), Vec2d(200., 200.), Vec2d(-200., 200.) });
     config.set_deserialize_strict({
         { "enable_support",                        1 },
         { "support_type",                         "tree(auto)" },
@@ -327,7 +332,7 @@ bool round_terminal_layers_form_resin_style_runup(const PrintObject &object)
                 break;
             }
         if (upper == nullptr)
-            continue;
+            return false;
 
         const double nominal_area = PI * sqr(double(contact.nominal_radius));
         const double area_ratio   = std::abs(upper->area()) / nominal_area;
@@ -420,7 +425,7 @@ struct TerminalRunupSample {
 };
 
 std::vector<TerminalRunupSample> terminal_runup_samples(
-    const PrintObject &object, double sample_depth_mm = 0.4,
+    const PrintObject &object, double sample_depth_mm = 0.15,
     double *overall_minimum_support_ratio = nullptr)
 {
     std::vector<TerminalRunupSample> samples;
@@ -431,23 +436,26 @@ std::vector<TerminalRunupSample> terminal_runup_samples(
         while (terminal_layer_idx < layers.size() &&
                std::abs(layers[terminal_layer_idx]->print_z - contact.support_tip_z) >= EPSILON)
             ++ terminal_layer_idx;
-        if (terminal_layer_idx == layers.size())
-            continue;
+        REQUIRE(terminal_layer_idx < layers.size());
 
         const ExPolygon *upper = nullptr;
+        bool contact_found = false;
         for (const ExPolygon &island : layers[terminal_layer_idx]->support_islands)
             if (island.contains(contact.position)) {
+                contact_found = true;
                 const double nominal_area = PI * sqr(double(contact.nominal_radius));
                 const double area_ratio = std::abs(island.area()) / nominal_area;
                 if (area_ratio >= 0.9 && area_ratio <= 1.1)
                     upper = &island;
                 break;
             }
+        REQUIRE(contact_found);
         if (upper == nullptr)
             continue;
 
         const Point terminal_center = upper->contour.centroid();
         const ExPolygon *sample = upper;
+        bool isolated_runup = true;
         double sampled_depth = 0.;
         double minimum_support_ratio = 1.;
         for (size_t depth = 1; depth <= terminal_layer_idx; ++ depth) {
@@ -463,8 +471,12 @@ std::vector<TerminalRunupSample> terminal_runup_samples(
                     lower = &island;
                 }
             }
-            if (lower == nullptr)
-                break;
+            REQUIRE(lower != nullptr);
+            // A nearby junction can merge into the lower footprint. Its
+            // centroid does not measure the terminal axis; connectivity is
+            // checked separately for every contact, including these joins.
+            if (lower->area() > 4. * upper->area())
+                isolated_runup = false;
             const double upper_area = std::abs(sample->area());
             if (upper_area > 0.) {
                 const double support_ratio = largest_overlap_area / upper_area;
@@ -476,7 +488,7 @@ std::vector<TerminalRunupSample> terminal_runup_samples(
             if (sampled_depth + EPSILON >= sample_depth_mm)
                 break;
         }
-        if (sampled_depth + EPSILON < sample_depth_mm)
+        if (!isolated_runup || sampled_depth + EPSILON < sample_depth_mm)
             continue;
 
         const Point upward_delta_scaled = terminal_center - sample->contour.centroid();
@@ -491,7 +503,7 @@ std::vector<TerminalRunupSample> terminal_runup_samples(
     return samples;
 }
 
-TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample_depth_mm = 0.4)
+TerminalRunupStats terminal_runup_stats(const PrintObject &object, double sample_depth_mm = 0.15)
 {
     double minimum_support_ratio = 1.;
     const std::vector<TerminalRunupSample> samples =
@@ -581,6 +593,65 @@ TriangleMesh sloped_underside_coupon(double angle_degrees, bool invert_underside
     roof.translate(Vec3f(0.f, 0.f, 15.f));
     stem.merge(roof);
     return stem;
+}
+
+// Check emitted material as well as islands: a polygon can survive while its
+// inset perimeter vanishes, or a steep taper can land inside a hollow trunk.
+void require_connected_contacts(const PrintObject &object)
+{
+    const auto layers = object.support_layers();
+    REQUIRE_FALSE(object.support_contacts().empty());
+    std::vector<Polygons> extrusions;
+    extrusions.reserve(layers.size());
+    for (const SupportLayer *layer : layers)
+        extrusions.push_back(union_(layer->support_fills.polygons_covered_by_width()));
+    for (const SupportContact &contact : object.support_contacts()) {
+        CAPTURE(contact.position, contact.support_tip_z);
+        auto terminal = std::find_if(layers.begin(), layers.end(), [&](const SupportLayer *layer) {
+            return std::abs(layer->print_z - contact.support_tip_z) < EPSILON;
+        });
+        REQUIRE(terminal != layers.end());
+        ExPolygons connected;
+        for (const ExPolygon &island : (*terminal)->support_islands)
+            if (island.contains(contact.position))
+                connected.push_back(island);
+        REQUIRE_FALSE(connected.empty());
+        // Follow the entire connection, including extended approaches and merged
+        // junctions. No missing layer/contact may silently drop out of the test.
+        for (size_t idx = size_t(terminal - layers.begin()); idx > 0; -- idx) {
+            const Polygons printed = intersection_clipped(to_polygons(connected), extrusions[idx]);
+            REQUIRE_FALSE(printed.empty());
+            ExPolygons lower;
+            for (const ExPolygon &island : layers[idx - 1]->support_islands)
+                if (!intersection_ex(connected, ExPolygons{ island }).empty())
+                    lower.push_back(island);
+            if (lower.empty()) {
+                // Organic roots may terminate on the fixture's central stem.
+                const auto model_layer = std::find_if(object.layers().begin(), object.layers().end(),
+                    [&](const Layer *layer) {
+                        return std::abs(layer->print_z - layers[idx - 1]->print_z) < EPSILON;
+                    });
+                REQUIRE(model_layer != object.layers().end());
+                REQUIRE_FALSE(intersection_ex(connected, (*model_layer)->lslices).empty());
+                break;
+            }
+            REQUIRE_FALSE(intersection_clipped(printed, extrusions[idx - 1]).empty());
+            // Original Organic fallbacks retain their wider terminal; the
+            // direct 98% footprint rule applies to the round Pin candidates.
+            const double tip_area = std::abs(area(to_polygons(connected)));
+            const double nominal_area = PI * sqr(double(contact.nominal_radius));
+            if (std::abs(contact.support_tip_z - layers[idx]->print_z) < EPSILON &&
+                tip_area >= 0.9 * nominal_area && tip_area <= 1.1 * nominal_area) {
+                for (const ExPolygon &component : connected) {
+                    double overlap = 0.;
+                    for (const ExPolygon &part : intersection_ex(ExPolygons{ component }, lower))
+                        overlap += part.area();
+                    CHECK(overlap / component.area() >= 0.98 - 1e-5);
+                }
+            }
+            connected = std::move(lower);
+        }
+    }
 }
 
 } // namespace
@@ -1147,6 +1218,24 @@ TEST_CASE("Organic Pins taper continuously through the branch and tip", "[Suppor
 
     const PrintObject &object = *print.objects().front();
     const auto layers = object.support_layers();
+    std::vector<std::vector<size_t>> descendants(layers.size());
+    for (size_t idx = 0; idx < layers.size(); ++ idx) {
+        descendants[idx].assign(layers[idx]->support_islands.size(), 0);
+        for (size_t island = 0; island < descendants[idx].size(); ++ island)
+            for (const SupportContact &contact : object.support_contacts())
+                if (std::abs(contact.support_tip_z - layers[idx]->print_z) < EPSILON &&
+                    layers[idx]->support_islands[island].contains(contact.position))
+                    ++ descendants[idx][island];
+    }
+    // Count contacts by their actual connected paths. Testing only whether a
+    // lower island contains the original contact XY misses displaced junctions.
+    for (size_t idx = layers.size(); idx-- > 1;)
+        for (size_t upper = 0; upper < descendants[idx].size(); ++ upper)
+            if (descendants[idx][upper] > 0)
+                for (size_t lower = 0; lower < descendants[idx - 1].size(); ++ lower)
+                    if (!intersection_ex(ExPolygons{ layers[idx]->support_islands[upper] },
+                                         ExPolygons{ layers[idx - 1]->support_islands[lower] }).empty())
+                        descendants[idx - 1][lower] += descendants[idx][upper];
     size_t checked = 0;
     for (const SupportContact &contact : object.support_contacts()) {
         auto terminal = std::find_if(layers.begin(), layers.end(), [&](const SupportLayer *layer) {
@@ -1167,10 +1256,7 @@ TEST_CASE("Organic Pins taper continuously through the branch and tip", "[Suppor
             if (island == layer.support_islands.end())
                 break;
             // Merged branches do not describe the taper of a single Pin.
-            const size_t contacts_in_island = std::count_if(object.support_contacts().begin(),
-                object.support_contacts().end(), [&](const SupportContact &other) {
-                    return island->contains(other.position);
-                });
+            const size_t contacts_in_island = descendants[idx][size_t(island - layer.support_islands.begin())];
             if (contacts_in_island != 1)
                 break;
             const double radius = unscale<double>(std::sqrt(std::abs(island->area()) / PI));
@@ -1189,8 +1275,57 @@ TEST_CASE("Organic Pins taper continuously through the branch and tip", "[Suppor
     REQUIRE(checked >= 1);
 }
 
+TEST_CASE("Organic Pin contacts remain connected through displaced joins and nearby junctions", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    const double layer_height = GENERATE(0.05, 0.06);
+    const double spacing = GENERATE(1.5, 4.0);
+    const double height_scale = GENERATE(0.2, 1.0);
+    DynamicPrintConfig config = organic_contact_config(spacing, 20.);
+    config.set_deserialize_strict({
+        { "layer_height", layer_height },
+        { "initial_layer_print_height", layer_height },
+        { "support_top_z_distance", 0.0 },
+        { "tree_support_round_tip", true },
+    });
+    TriangleMesh fixture = sloped_underside_coupon(20.);
+    fixture.scale(Vec3f(1.f, 1.f, float(height_scale)));
+    Print print;
+    Model model;
+    init_print({ fixture }, print, model, config);
+    print.process();
+    CAPTURE(layer_height, spacing, height_scale);
+    require_connected_contacts(*print.objects().front());
+}
+
+TEST_CASE("Organic Pins report contacts whose bed-clipped connections cannot be printed", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    DynamicPrintConfig config = organic_contact_config(4., 10.);
+    config.set_deserialize_strict({
+        { "layer_height", 0.05 },
+        { "initial_layer_print_height", 0.05 },
+        { "support_top_z_distance", 0.0 },
+        { "tree_support_round_tip", true },
+    });
+    config.set_key_value("printable_area", new ConfigOptionPoints{
+        Vec2d(0., 0.), Vec2d(10., 0.), Vec2d(10., 10.), Vec2d(0., 10.) });
+    Print print;
+    Model model;
+    init_print({ sloped_underside_coupon(0.) }, print, model, config);
+    try {
+        print.process();
+        FAIL("A clipped-away Pin connection must stop slicing");
+    } catch (const SlicingError &error) {
+        CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("object.stl"));
+        CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("X="));
+        CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("Y="));
+        CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("Z="));
+        CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("disable round Pin tips"));
+    }
+}
+
 TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[SupportMaterial][OrganicContacts][MiniaturePin]")
 {
+    const double layer_height = GENERATE(0.05, 0.06);
     // The 20-degree underside resolves a normal at both limits, so the
     // constrained case measures an actual tilted Pin.
     const auto [underside_angle, maximum_tip_angle] = GENERATE(table<double, double>({
@@ -1200,8 +1335,8 @@ TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[Suppor
 
     DynamicPrintConfig config = organic_contact_config(4., 10.);
     config.set_deserialize_strict({
-        { "layer_height",                      0.05 },
-        { "initial_layer_print_height",        0.05 },
+        { "layer_height",                      layer_height },
+        { "initial_layer_print_height",        layer_height },
         { "support_top_z_distance",            0.0 },
         { "tree_support_branch_angle_organic", maximum_tip_angle },
         { "tree_support_round_tip",            true },
@@ -1238,6 +1373,76 @@ TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[Suppor
     }
 }
 
+TEST_CASE("Organic Pins sample normals at rendered contacts on curved surfaces", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    const double layer_height = GENERATE(0.05, 0.06);
+    DynamicPrintConfig config = organic_contact_config(3., 13.33);
+    config.set_deserialize_strict({
+        { "layer_height", layer_height },
+        { "initial_layer_print_height", layer_height },
+        { "support_top_z_distance", 0.0 },
+        { "tree_support_round_tip", true },
+        { "tree_support_branch_angle_organic", 30.0 },
+    });
+    // A shallow ellipsoid provides curved normals within the permitted angle
+    // over a broad region outside the stem's collision clearance.
+    TriangleMesh fixture = make_sphere(8., PI / 180.);
+    fixture.scale(Vec3f(1.f, 1.f, 0.3f));
+    fixture.translate(Vec3f(0.f, 0.f, 13.f));
+    TriangleMesh stem = make_cube(1., 1., 13.);
+    stem.translate(Vec3f(-7.5f, -0.5f, 0.f));
+    fixture.merge(stem);
+    Print print;
+    Model model;
+    init_print({ fixture }, print, model, config);
+    print.process();
+    const PrintObject &object = *print.objects().front();
+    TriangleMesh transformed = object.model_object()->raw_mesh();
+    transformed.transform(object.trafo_centered(), true);
+    const AABBMesh surface(transformed);
+    require_connected_contacts(object);
+    const auto samples = terminal_runup_samples(object, layer_height);
+    REQUIRE_FALSE(samples.empty());
+    size_t aligned = 0;
+    size_t reduced = 0;
+    for (const auto &sample : samples) {
+        const Vec2d stem_center = (object.trafo_centered() * Vec3d(-7., 0., 0.)).head<2>();
+        // The central stem obstructs the approach of these contacts. Reduced
+        // tilt there is expected; measure normals where the curve has room.
+        if ((sample.contact_center - stem_center).norm() < 3.)
+            continue;
+        const auto contact = std::find_if(object.support_contacts().begin(), object.support_contacts().end(),
+            [&](const SupportContact &value) {
+                return (unscaled<double>(value.position) - sample.contact_center).norm() < EPSILON;
+            });
+        REQUIRE(contact != object.support_contacts().end());
+        const auto hit = surface.query_ray_hit(Vec3d(sample.contact_center.x(), sample.contact_center.y(),
+                                                     contact->support_tip_z - 0.5), Vec3d::UnitZ());
+        REQUIRE(hit.is_hit());
+        const Vec3d normal = -hit.normal().normalized();
+        if (normal.z() < std::cos(28. * PI / 180.))
+            continue;
+        const Vec3d axis = Vec3d(sample.slope.x(), sample.slope.y(), 1.).normalized();
+        const double error = std::acos(std::clamp(axis.dot(normal), -1., 1.)) * 180. / PI;
+        CAPTURE(layer_height, sample.contact_center, sample.slope, normal, error);
+        // Short branches on this curved fixture sometimes require less tilt.
+        // They must still face the surface normal's azimuth, never lean past it.
+        CHECK(sample.angle_degrees <= std::acos(normal.z()) * 180. / PI + 2.);
+        if (sample.slope.norm() > 0.01) {
+            const double azimuth_error = std::acos(std::clamp(
+                sample.slope.normalized().dot(normal.head<2>().normalized()), -1., 1.)) * 180. / PI;
+            CHECK(azimuth_error <= 2.);
+        }
+        if (error <= 2.)
+            ++ aligned;
+        else
+            ++ reduced;
+    }
+    REQUIRE(aligned > 0);
+    if (layer_height == 0.05)
+        REQUIRE(reduced > 0);
+}
+
 TEST_CASE("Direct Organic Pin tips follow underside normals in multiple directions", "[SupportMaterial][OrganicContacts][MiniaturePin]")
 {
     DynamicPrintConfig config = organic_contact_config(3., 13.33);
@@ -1261,10 +1466,12 @@ TEST_CASE("Direct Organic Pin tips follow underside normals in multiple directio
     print.process();
 
     const PrintObject &object = *print.objects().front();
+    require_connected_contacts(object);
     const std::vector<TerminalRunupSample> samples = terminal_runup_samples(object);
     CAPTURE(samples.size(), object.support_contacts().size());
     REQUIRE_FALSE(samples.empty());
-    REQUIRE(samples.size() == object.support_contacts().size());
+    // Original Organic fallbacks are checked for connectivity above; only
+    // isolated round Pins have a measurable runup axis.
     const auto &panels = multi_normal_test_panels();
     const Transform3d object_transform = object.trafo_centered();
     const double maximum_panel_distance =
@@ -1480,6 +1687,7 @@ TEST_CASE("Prusa XL miniature profiles realize direct Pin contacts on physical t
             std::vector<Preset> selected_filaments(5, *filament);
             DynamicPrintConfig config = PresetBundle::construct_full_config(
                 *machine, *process, project_config, selected_filaments, true, std::nullopt);
+            config.set_key_value("gcode_comments", new ConfigOptionBool(true));
             CHECK(config.opt_bool("tree_support_round_tip"));
             CHECK_THAT(config.opt_float("tree_support_angle_slow"),
                        Catch::Matchers::WithinAbs(25.0, 1e-9));
@@ -1491,6 +1699,9 @@ TEST_CASE("Prusa XL miniature profiles realize direct Pin contacts on physical t
             Print print;
             Model model;
             init_print({ std::move(coupon) }, print, model, config);
+            ModelInstance *instance = model.objects.front()->instances.front();
+            instance->set_offset(instance->get_offset() + Vec3d(100., 100., 0.));
+            print.apply(model, config);
             print.process();
 
             const PrintObject &object = *print.objects().front();
@@ -1509,6 +1720,9 @@ TEST_CASE("Prusa XL miniature profiles realize direct Pin contacts on physical t
             Print repeated_print;
             Model repeated_model;
             init_print({ std::move(repeated_coupon) }, repeated_print, repeated_model, config);
+            ModelInstance *repeated_instance = repeated_model.objects.front()->instances.front();
+            repeated_instance->set_offset(repeated_instance->get_offset() + Vec3d(100., 100., 0.));
+            repeated_print.apply(repeated_model, config);
             repeated_print.process();
             CHECK(contact_signatures(*repeated_print.objects().front()) == signatures);
 
@@ -1537,6 +1751,9 @@ TEST_CASE("Prusa XL miniature profiles realize direct Pin contacts on physical t
             Print miniature_print;
             Model miniature_model;
             init_print({ std::move(miniature_fixture) }, miniature_print, miniature_model, config);
+            ModelInstance *miniature_instance = miniature_model.objects.front()->instances.front();
+            miniature_instance->set_offset(miniature_instance->get_offset() + Vec3d(100., 100., 0.));
+            miniature_print.apply(miniature_model, config);
             miniature_print.process();
             CHECK_FALSE(miniature_print.objects().front()->support_contacts().empty());
             CHECK(miniature_print.validate_support_contact_export().empty());
