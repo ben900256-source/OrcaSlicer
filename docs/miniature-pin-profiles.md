@@ -23,7 +23,7 @@ The source profile was made for different hardware. This fork reuses its geometr
 | Speeds | Outer/top 35, inner 55, solid 45, sparse 65, gap 30, support 45, travel 325 mm/s | XL process acceleration values are retained instead of the source machine's limits |
 | Adhesion and precision | 2-loop skirt, 6 mm outer brim, reduced wall crossing, curled-perimeter slowdown, 0.001 mm slicing resolution | The brim uses zero object gap so it remains coupled to the miniature and support bases; applied through a hidden cross-printer base |
 | Supports | Automatic Organic supports | Supports are allowed everywhere, including model-supported islands |
-| Pin contact | Community interface geometry replaced | No interface layers; direct-contact round Pin with a 0.8 mm conical runup and 1.6 mm eased Organic socket; 0.4 mm support width/tip, 2 mm branches, 5 degree diameter angle, 3 mm branch distance, 13.33% density |
+| Pin contact | Community interface geometry replaced | No interface layers; direct-contact round Pin with a continuous curved taper across the 1.6 mm Organic approach and final 0.8 mm tip; 0.4 mm support width/tip, 2 mm branches, 5 degree diameter angle, 3 mm branch distance, 13.33% density |
 | Layer variants | 0.06 mm source baseline | Experimental zero-clearance contact for both Balanced and Ultra Detail; the Pin axis follows moderate underside normals and is reduced or made vertical when needed for printable support |
 | Extrusion roles | Not retained | Walls, infill, solid/top/bottom surfaces, bridges through their owning roles, and support base/interface are fixed to tool 2 |
 | Filament | Generic PLA starting point | 3 mm³/s cap, full cooling, and tool-index-aware XL pressure-advance G-code |

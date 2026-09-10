@@ -343,9 +343,9 @@ bool round_terminal_layers_form_resin_style_runup(const PrintObject &object)
         size_t isolated_taper_layers = 0;
         double previous_area = std::abs(upper->area());
         double maximum_isolated_radius = contact.nominal_radius;
-        bool cone_base_is_supported = false;
+        bool runup_base_is_supported = false;
         // A long sequence of concentric, progressively larger elliptical slices
-        // leads from the centered pin into one untouched Organic tube layer below.
+        // leads from the centered pin into the curved Organic approach below.
         for (size_t depth = 1; depth <= runup_base_depth + 1; ++ depth) {
             const ExPolygon *overlapping = nullptr;
             for (const ExPolygon &island : layers[layer_idx - depth]->support_islands)
@@ -355,16 +355,15 @@ bool round_terminal_layers_form_resin_style_runup(const PrintObject &object)
                 }
             if (overlapping == nullptr)
                 return false;
-            // The lowest runup layer is the natural Organic tube. It must almost
-            // entirely carry the first conical ellipse immediately above it.
+            // The start of the runup must carry the next terminal layer.
             if (depth == runup_base_depth) {
-                const double cone_base_area = std::abs(upper->area());
+                const double runup_base_area = std::abs(upper->area());
                 double supported_area = 0.;
                 for (const ExPolygon &overlap :
                      intersection_ex(ExPolygons{ *upper }, ExPolygons{ *overlapping }))
                     supported_area += std::abs(overlap.area());
-                const double support_ratio = cone_base_area > 0. ? supported_area / cone_base_area : 0.;
-                cone_base_is_supported = support_ratio >= 0.98;
+                const double support_ratio = runup_base_area > 0. ? supported_area / runup_base_area : 0.;
+                runup_base_is_supported = support_ratio >= 0.98;
             }
             if (depth <= runup_base_depth) {
                 const size_t contacts_in_island = std::count_if(
@@ -399,7 +398,7 @@ bool round_terminal_layers_form_resin_style_runup(const PrintObject &object)
             runup_base_depth >= 10 && isolated_taper_layers >= 4 &&
             maximum_isolated_radius >= 1.5 * contact.nominal_radius)
             ++ tapered_checked;
-        if (cone_base_is_supported)
+        if (runup_base_is_supported)
             ++ supported_bases_checked;
     }
     return checked >= 6 && tapered_checked >= 6 && supported_bases_checked >= 6;
@@ -1130,10 +1129,72 @@ TEST_CASE("Round Organic Pin tips meet terminal footprint limits", "[SupportMate
     }
 }
 
+TEST_CASE("Organic Pins taper continuously through the branch and tip", "[SupportMaterial][OrganicContacts][MiniaturePin]")
+{
+    const double layer_height = GENERATE(0.05, 0.06);
+    const double top_gap = GENERATE(0., 0.06);
+    DynamicPrintConfig config = organic_contact_config(4., 10.);
+    config.set_deserialize_strict({
+        { "layer_height",               layer_height },
+        { "initial_layer_print_height", layer_height },
+        { "support_top_z_distance",     top_gap },
+        { "tree_support_round_tip",     true },
+    });
+    Print print;
+    Model model;
+    init_print({ sloped_underside_coupon(0.) }, print, model, config);
+    print.process();
+
+    const PrintObject &object = *print.objects().front();
+    const auto layers = object.support_layers();
+    size_t checked = 0;
+    for (const SupportContact &contact : object.support_contacts()) {
+        auto terminal = std::find_if(layers.begin(), layers.end(), [&](const SupportLayer *layer) {
+            return std::abs(layer->print_z - contact.support_tip_z) < EPSILON;
+        });
+        REQUIRE(terminal != layers.end());
+        const size_t terminal_idx = size_t(terminal - layers.begin());
+        double previous_radius = unscale<double>(contact.nominal_radius);
+        double previous_z = contact.support_tip_z;
+        size_t approach_layers = 0;
+        for (size_t idx = terminal_idx; idx-- > 0;) {
+            const SupportLayer &layer = *layers[idx];
+            const double depth = contact.support_tip_z - layer.print_z;
+            if (depth > 2.4 + layer_height)
+                break;
+            const auto island = std::find_if(layer.support_islands.begin(), layer.support_islands.end(),
+                [&](const ExPolygon &polygon) { return polygon.contains(contact.position); });
+            if (island == layer.support_islands.end())
+                break;
+            // Merged branches do not describe the taper of a single Pin.
+            const size_t contacts_in_island = std::count_if(object.support_contacts().begin(),
+                object.support_contacts().end(), [&](const SupportContact &other) {
+                    return island->contains(other.position);
+                });
+            if (contacts_in_island != 1)
+                break;
+            const double radius = unscale<double>(std::sqrt(std::abs(island->area()) / PI));
+            CAPTURE(layer_height, top_gap, depth, previous_radius, radius);
+            // A shoulder produces a sudden radial jump, even when every upper
+            // layer is fully supported. Bound the surface slope across the join.
+            CHECK((radius - previous_radius) / (previous_z - layer.print_z) < 1.5);
+            if (depth >= 0.7 && depth <= 1.2)
+                ++ approach_layers;
+            previous_radius = radius;
+            previous_z = layer.print_z;
+        }
+        if (approach_layers >= 6)
+            ++ checked;
+    }
+    REQUIRE(checked >= 1);
+}
+
 TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[SupportMaterial][OrganicContacts][MiniaturePin]")
 {
+    // The 20-degree underside resolves a normal at both limits, so the
+    // constrained case measures an actual tilted Pin.
     const auto [underside_angle, maximum_tip_angle] = GENERATE(table<double, double>({
-        { 0., 30. }, { 20., 30. }, { 55., 10. }
+        { 0., 30. }, { 20., 30. }, { 20., 10. }
     }));
     CAPTURE(underside_angle, maximum_tip_angle);
 
@@ -1171,7 +1232,8 @@ TEST_CASE("Direct Organic Pin tips follow printable underside normals", "[Suppor
                    Catch::Matchers::WithinAbs(underside_angle, 2.0));
         CHECK(runup.median_x_slope > 0.);
     } else {
-        CHECK(runup.max_angle_degrees <= maximum_tip_angle + 1.0);
+        CHECK_THAT(runup.max_angle_degrees,
+                   Catch::Matchers::WithinAbs(maximum_tip_angle, 1.0));
         CHECK(runup.median_x_slope > 0.);
     }
 }

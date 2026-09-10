@@ -7096,7 +7096,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("tree_support_round_tip", coBool);
     def->label = L("Round branch tips");
     def->category = L("Support");
-    def->tooltip = L("Shape the final 0.8 mm of an Organic support branch into a small circular Pin contact and an eased 1.6 mm socket. "
+    def->tooltip = L("Smoothly taper an Organic support branch through a 1.6 mm curved approach and final 0.8 mm tip into a small circular Pin contact. "
                      "With zero Top Z distance and no top interface, the Pin axis follows the model's underside surface normal when it can remain printable; configured-gap Pins remain vertical. "
                      "Zero-clearance contact with the same PLA may fuse to or mark the model.");
     def->mode = comAdvanced;
